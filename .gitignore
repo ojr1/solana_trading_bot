@@ -1,0 +1,12 @@
+# Credentials - NEVER commit
+.env
+*.session
+*.session-journal
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Logs
+logs/
