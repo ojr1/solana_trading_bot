@@ -55,6 +55,11 @@ POLL_INTERVAL_SECONDS = 5
 LOGS_DIR = Path("logs")
 POSITIONS_FILE = LOGS_DIR / "positions.json"
 
+# How often a status line is written for each open position. Without this the
+# monitor is silent unless something fails, so there is no way to distinguish
+# "nothing is happening" from "pricing has silently stopped working".
+STATUS_INTERVAL_SECONDS = 300
+
 # Positions that have closed are kept in the file for later analysis rather
 # than deleted, but are skipped by the monitor.
 load_dotenv()
@@ -85,9 +90,11 @@ def setup_logging():
 
 
 log = setup_logging()
-# Telethon logs connection detail at INFO, which drowns out the trading
+
+# Telethon logs every connection detail at INFO, which buries the trading
 # output. Warnings and errors still come through.
 logging.getLogger("telethon").setLevel(logging.WARNING)
+
 
 # ==========================================================================
 # POSITION STORE
@@ -304,7 +311,13 @@ async def monitor_positions():
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
 
+# Timestamp of the last status heartbeat.
+_last_status_at = 0.0
+
+
 async def _monitor_once(session):
+    global _last_status_at
+
     open_positions = {k: v for k, v in POSITIONS.items() if not v["closed"]}
     if not open_positions:
         return
@@ -312,6 +325,24 @@ async def _monitor_once(session):
     market_caps = await market_data.fetch_market_caps(session, list(open_positions))
     now = time.time()
     changed = False
+
+    # Periodic proof of life. Also surfaces positions the API has stopped
+    # returning data for, which is itself a meaningful signal - a token that
+    # has vanished from Jupiter is usually one with no liquidity left.
+    if now - _last_status_at >= STATUS_INTERVAL_SECONDS:
+        _last_status_at = now
+        for contract, position in open_positions.items():
+            mc = market_caps.get(contract)
+            if mc is None:
+                log.warning("STATUS %-10s NO PRICE DATA returned", position["ticker"])
+                continue
+            value = position_value_sol(position, mc)
+            pnl = value + position["realised_sol"] - position["sol_invested"]
+            log.info(
+                "STATUS %-10s $%s  (entry $%s)  holding %.4f SOL  P&L %+.4f SOL",
+                position["ticker"], f"{mc:,.0f}", f"{position['entry_mc']:,.0f}",
+                value, pnl,
+            )
 
     for contract, position in open_positions.items():
         current_mc = market_caps.get(contract)
