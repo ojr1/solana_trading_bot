@@ -34,6 +34,7 @@ import aiohttp
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
+import data_logger
 import entry_logic
 import exit_logic
 import market_data
@@ -229,6 +230,10 @@ async def open_position(decision, call):
                 "REJECT %-9s live $%s (call said $%s)  | above hard cut at fill time",
                 decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}",
             )
+            data_logger.log_call(
+                "rejected_fill", call, decision, live_mc=live_mc,
+                reason="above hard cut at fill time",
+            )
             return
         entry_mc = live_mc
         gap_pct = (live_mc / call_mc - 1) * 100
@@ -283,6 +288,9 @@ async def open_position(decision, call):
 
     POSITIONS[contract] = position
     save_positions(POSITIONS)
+
+    data_logger.log_call("bought", call, decision, live_mc=live_mc)
+    data_logger.log_fill("buy", position, first["sol"], entry_mc, stage=1)
 
     log.info(
         "OPEN  %-10s $%s  PCR %.3f  buy 1/%d: %.3f SOL of %.3f planned",
@@ -372,6 +380,11 @@ def check_dca_fills(position, current_mc):
     # Averaging down moves break-even, which moves every exit threshold with it.
     position["entry_mc"] = breakeven_mc(position)
 
+    data_logger.log_fill(
+        "buy", position, next_tranche["sol"], current_mc,
+        stage=next_tranche["stage"],
+    )
+
     return {
         "stage": next_tranche["stage"],
         "sol": next_tranche["sol"],
@@ -434,6 +447,7 @@ async def _monitor_once(session):
                 position["ticker"], f"{mc:,.0f}", f"{position['entry_mc']:,.0f}",
                 value, pnl,
             )
+            data_logger.log_snapshot(position, mc, value, pnl)
 
     for contract, position in open_positions.items():
         current_mc = market_caps.get(contract)
@@ -459,6 +473,14 @@ async def _monitor_once(session):
                 position["ticker"], action["exit_type"],
                 action["pct_of_original_position"], f"{current_mc:,.0f}",
                 proceeds, action["reason"],
+            )
+            data_logger.log_fill(
+                "sell", position, None, current_mc,
+                exit_type=action["exit_type"],
+                pct_of_original=action["pct_of_original_position"],
+                proceeds_sol=proceeds,
+                reason=action["reason"],
+                position_closed=action["position_closed"],
             )
 
             if action["position_closed"]:
@@ -513,6 +535,10 @@ async def on_message(event):
     if not parsed["parse_ok"]:
         log.warning("PARSE FAIL  missing %s | %s",
                     parsed["missing_fields"], text[:60].replace("\n", " "))
+        data_logger.log_call(
+            "parse_fail", parsed,
+            reason=f"missing {parsed['missing_fields']}", raw_text=text,
+        )
         return
 
     contract = parsed["contract_address"]
@@ -521,6 +547,10 @@ async def on_message(event):
     # message must not open a second position in the same token.
     if contract in POSITIONS:
         log.info("SKIP  %-10s already held or previously traded", parsed["ticker"])
+        data_logger.log_call(
+            "duplicate", parsed,
+            reason="contract already held or previously traded",
+        )
         return
 
     decision = entry_logic.decide_entry(parsed)
@@ -528,6 +558,7 @@ async def on_message(event):
     if decision["action"] == "reject":
         log.info("REJECT %-9s $%s  | %s", parsed["ticker"],
                  f"{parsed['market_cap']:,.0f}", decision["reason"])
+        data_logger.log_call("rejected", parsed, decision)
         return
 
     await open_position(decision, parsed)
