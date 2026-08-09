@@ -105,12 +105,27 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 # ==========================================================================
 
 
+def _migrate_tranches(positions):
+    """
+    Normalises pending tranches saved by an older entry_logic version.
+
+    The tranche key was renamed from drop_pct to drop_pct_from_previous_fill
+    when DCA was reworked. Positions stored under the old name would crash the
+    monitor loop on every cycle, so they are converted here at load time.
+    """
+    for position in positions.values():
+        for tranche in position.get("pending_tranches", []):
+            if "drop_pct_from_previous_fill" not in tranche:
+                tranche["drop_pct_from_previous_fill"] = tranche.get("drop_pct", 10)
+    return positions
+
+
 def load_positions():
     if not POSITIONS_FILE.exists():
         return {}
     try:
         with open(POSITIONS_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            return _migrate_tranches(json.load(f))
     except (json.JSONDecodeError, OSError) as exc:
         log.error("Could not read positions file (%s). Starting empty.", exc)
         return {}
@@ -178,11 +193,55 @@ async def open_position(decision, call):
 
     Only the first tranche fills here. Later stages are stored as pending and
     fill when the price drops far enough - see check_dca_fills.
+
+    THE FILL PRICE IS THE LIVE MARKET CAP, NOT THE ONE IN THE MESSAGE. The
+    figure GemTools prints was measured before the message was composed,
+    delivered and parsed; a real buy happens at whatever the price is now.
+    Observed gaps have exceeded 25% within a second of a call. Using the
+    stale figure inflates P&L and misplaces every exit threshold, so:
+
+      - the PCR is still scored on the GemTools snapshot (the judgement is
+        about the call as made), but
+      - the position's entry is the live price, and
+      - the live price is re-checked against the hard cut, so a coin that
+        has already run past $75K by the time the message arrives cannot
+        slip in under its stale figure.
+
+    If no live price is available (very new tokens are sometimes not yet
+    indexed), the call figure is used as a fallback and flagged in the log.
     """
     contract = decision["contract_address"]
     tranches = decision["tranches"]
     first = tranches[0]
-    entry_mc = call["market_cap"]
+    call_mc = call["market_cap"]
+
+    live_mc = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            caps = await market_data.fetch_market_caps(session, [contract])
+        live_mc = caps.get(contract)
+    except aiohttp.ClientError as exc:
+        log.warning("Live price fetch failed for %s: %s", decision["ticker"], exc)
+
+    if live_mc is not None:
+        if live_mc >= entry_logic.MC_HARD_CUT:
+            log.info(
+                "REJECT %-9s live $%s (call said $%s)  | above hard cut at fill time",
+                decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}",
+            )
+            return
+        entry_mc = live_mc
+        gap_pct = (live_mc / call_mc - 1) * 100
+        log.info(
+            "FILL  %-10s live $%s vs call $%s  (gap %+.1f%%)",
+            decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}", gap_pct,
+        )
+    else:
+        entry_mc = call_mc
+        log.warning(
+            "FILL  %-10s no live price - falling back to call figure $%s",
+            decision["ticker"], f"{call_mc:,.0f}",
+        )
 
     tokens = tokens_for(first["sol"], entry_mc, entry_mc)
 
@@ -193,6 +252,7 @@ async def open_position(decision, call):
         # Accounting
         "reference_mc": entry_mc,
         "entry_mc": entry_mc,
+        "call_mc": call_mc,
         "sol_invested": first["sol"],
         "total_tokens_bought": tokens,
         "tokens_remaining": tokens,
@@ -231,7 +291,8 @@ async def open_position(decision, call):
     )
     if tranches[1:]:
         upcoming = ", ".join(
-            f"{t['sol']:.3f} SOL at -{t['drop_pct_from_previous_fill']}%"
+            f"{t['sol']:.3f} SOL at "
+            f"-{t.get('drop_pct_from_previous_fill', t.get('drop_pct', '?'))}%"
             for t in tranches[1:]
         )
         log.info("      pending tranches: %s", upcoming)
@@ -258,7 +319,19 @@ def check_dca_fills(position, current_mc):
         return None
 
     next_tranche = position["pending_tranches"][0]
-    drop = next_tranche["drop_pct_from_previous_fill"] / 100.0
+    drop_pct = next_tranche.get(
+        "drop_pct_from_previous_fill", next_tranche.get("drop_pct")
+    )
+    if drop_pct is None:
+        # An unrecognised tranche format - refuse to guess a trigger for it.
+        log.warning(
+            "DCA tranche for %s has no drop percentage - skipping it. "
+            "src/entry_logic.py is likely an outdated version.",
+            position["ticker"],
+        )
+        position["pending_tranches"].pop(0)
+        return None
+    drop = drop_pct / 100.0
     trigger_mc = position["last_fill_mc"] * (1 - drop)
 
     if current_mc > trigger_mc:
@@ -404,8 +477,19 @@ async def on_message(event):
         # Updates are logged only. They are the raw material for the whale-buy
         # regression described in spec section 13, so they are worth capturing
         # even though nothing acts on them yet.
+        #
+        # TEMPORARY DEBUG: some multiplier updates ("Just did xN" format) have
+        # no ticker, and the parser currently returns nothing for them. This
+        # branch captures the raw text of any such case so parser.py can be
+        # fixed against the real format instead of a guess. Remove once fixed.
         if kind != "unknown":
-            log.info("UPDATE %-9s %s", parsed.get("ticker") or "", kind)
+            if not parsed.get("ticker"):
+                log.warning(
+                    "UPDATE MISSING TICKER | raw: %s",
+                    text[:150].replace("\n", " "),
+                )
+            else:
+                log.info("UPDATE %-9s %s", parsed.get("ticker"), kind)
         return
 
     if not parsed["parse_ok"]:
@@ -441,6 +525,15 @@ async def main():
         raise SystemExit(
             "Missing credentials. Check .env contains TELEGRAM_API_ID, "
             "TELEGRAM_API_HASH and TELEGRAM_CHANNEL."
+        )
+
+    # Guards against running with a mismatched entry_logic version - the
+    # exact failure mode that produced a monitor-loop crash on every cycle.
+    if getattr(entry_logic, "MIN_BUY_SOL", None) != 0.10:
+        log.warning(
+            "src/entry_logic.py looks OUTDATED (MIN_BUY_SOL=%s, expected 0.1). "
+            "DCA tranching will not behave as designed.",
+            getattr(entry_logic, "MIN_BUY_SOL", "missing"),
         )
 
     log.info("=" * 66)

@@ -27,7 +27,7 @@ Structure of the PCR:
 # --- Position sizing -------------------------------------------------------
 MIN_LOT_SOL = 0.2          # total committed to a call at PCR = 0
 MAX_LOT_SOL = 0.5          # total committed to a call at PCR = 1
-MIN_BUY_SOL = 0.15         # smallest permitted individual buy transaction
+MIN_BUY_SOL = 0.10         # smallest permitted individual buy transaction
 MAX_TRANCHES = 3           # most buys a single call may be split across
 
 # --- Weights (must sum to 1.0) ---------------------------------------------
@@ -93,9 +93,21 @@ PCR_STRETCH_LO = 0.10
 PCR_STRETCH_HI = 0.60
 
 # --- DCA / multi-buy -------------------------------------------------------
-# Percentage price drop between tranches. Trigger logic is still provisional -
-# see spec section 5b. The sizing below is usable; the triggers are not final.
-DCA_DROP_STEP_PCT = 15
+# Price drop, measured from the PREVIOUS fill (not from the first buy), that
+# triggers the next tranche. Buy 3 therefore fires roughly 19% below buy 1,
+# not 20%.
+DCA_DROP_STEP_PCT = 10
+
+# Share of the total lot committed at each stage.
+#
+# The shape is deliberate: buy 1 is a probe made before the coin has proved
+# anything, buy 2 is the largest commitment because the price has improved
+# while the thesis is still intact, and buy 3 is slightly smaller again
+# because a second consecutive drop raises the odds the call is simply wrong.
+#
+# Both sets must sum to 1.0.
+DCA_WEIGHTS_THREE = (0.30, 0.38, 0.32)
+DCA_WEIGHTS_TWO = (0.45, 0.55)
 
 
 # ==========================================================================
@@ -264,47 +276,56 @@ def pcr_to_lot_size(pcr):
 
 def split_into_tranches(total_sol):
     """
-    Splits a total position size into individual buys.
+    Splits a total position size into staged buys.
 
-    The first tranche is the minimum permitted buy, so the smallest possible
-    amount is committed before the price has moved. Whatever remains is spread
-    evenly across the remaining tranches.
+    Tries a three-stage split first, falling back to two stages and then to a
+    single buy. The deciding constraint is MIN_BUY_SOL: a split is only used if
+    EVERY tranche it produces clears that floor, because a plan whose first buy
+    is too small to execute is not a plan.
 
-    A total that cannot be divided without breaching MIN_BUY_SOL is returned
-    as a single buy - a low-conviction call may legitimately end up as one
-    transaction simply because it is too small to split.
-
-    NOTE: the drop percentages that trigger later tranches are still
-    provisional (see spec section 5b). The sizes below are usable; the timing
-    rules are not yet final.
+    Consequence worth understanding: low-conviction calls naturally end up as a
+    single buy, because their total is too small to divide. Staged entry is
+    therefore something the strategy earns through conviction rather than
+    applies uniformly.
     """
     total_sol = round(total_sol, 4)
 
-    count = min(int(total_sol // MIN_BUY_SOL), MAX_TRANCHES)
-    if count <= 1:
-        return [{"sol": total_sol, "trigger": "immediate", "drop_pct": 0}]
+    for weights in (DCA_WEIGHTS_THREE, DCA_WEIGHTS_TWO):
+        amounts = [total_sol * w for w in weights]
 
-    tranches = [{"sol": MIN_BUY_SOL, "trigger": "immediate", "drop_pct": 0}]
+        # Tolerance guards against floating point noise at the boundary.
+        if all(a >= MIN_BUY_SOL - 1e-9 for a in amounts):
+            tranches = []
+            for i, amount in enumerate(amounts):
+                if i == 0:
+                    trigger = "immediate"
+                    drop = 0
+                else:
+                    drop = DCA_DROP_STEP_PCT
+                    trigger = f"{drop}% below buy {i} fill price"
+                tranches.append(
+                    {
+                        "stage": i + 1,
+                        "sol": round(amount, 4),
+                        "trigger": trigger,
+                        "drop_pct_from_previous_fill": drop,
+                    }
+                )
 
-    remaining = total_sol - MIN_BUY_SOL
-    per_tranche = remaining / (count - 1)
+            # Rounding can leave a few lamports unallocated; the residue goes on
+            # the final tranche so the stages always sum to the intended total.
+            residue = total_sol - sum(t["sol"] for t in tranches)
+            tranches[-1]["sol"] = round(tranches[-1]["sol"] + residue, 4)
+            return tranches
 
-    for i in range(1, count):
-        drop = DCA_DROP_STEP_PCT * i
-        tranches.append(
-            {
-                "sol": round(per_tranche, 4),
-                "trigger": f"price drops {drop}% from entry",
-                "drop_pct": drop,
-            }
-        )
-
-    # Rounding can leave a few lamports unallocated; add them to the last buy
-    # so the tranches always sum exactly to the intended total.
-    allocated = sum(t["sol"] for t in tranches)
-    tranches[-1]["sol"] = round(tranches[-1]["sol"] + (total_sol - allocated), 4)
-
-    return tranches
+    return [
+        {
+            "stage": 1,
+            "sol": total_sol,
+            "trigger": "immediate",
+            "drop_pct_from_previous_fill": 0,
+        }
+    ]
 
 
 # ==========================================================================

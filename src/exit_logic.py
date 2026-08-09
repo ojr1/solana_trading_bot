@@ -62,6 +62,21 @@ LADDER_STEP_LARGE = 100_000
 # intended behaviour - clipping every 5% at a $2M market cap is over-trading.
 MIN_GAP_BETWEEN_SELLS = 0.10
 
+# --- Absolute floor ----------------------------------------------------
+# Below this market cap, a position is treated as effectively dead regardless
+# of entry price, average cost, or how much DCA has occurred. This exists
+# because the ordinary stop-loss is measured against average entry - after a
+# multi-stage DCA fill, average entry falls with each buy, which pulls the
+# stop-loss trigger down too. A coin DCA'd to a $15K average entry has its
+# 55% stop-loss sitting around $6,750, meaning the position could keep
+# bleeding well past the point it is realistically dead. This floor overrides
+# that calculation entirely: any open position, in any state, is closed
+# immediately if market cap falls below it.
+#
+# Checked BEFORE stop-loss and trailing-stop logic, and applies regardless of
+# whether initials have been taken.
+ABSOLUTE_FLOOR_MC = 9_000
+
 # --- Loss limits -----------------------------------------------------------
 # Applies only before initials are taken, measured against average entry.
 STOP_LOSS_DRAWDOWN = 0.55
@@ -254,6 +269,22 @@ def check_exit_conditions(position, current_mc, now):
     """
     if position["closed"]:
         return []
+
+    # Absolute floor. Checked before anything else, and independent of
+    # whether initials have been taken - this is a hard override, not part
+    # of the normal stop-loss/trailing-stop decision tree. No confirmation
+    # delay, for the same reason as the stop-loss: on the way down, waiting
+    # only costs money.
+    if current_mc <= ABSOLUTE_FLOOR_MC:
+        _clear_pending(position)
+        return [
+            _sell(
+                position, 1.0,
+                f"absolute floor: market cap ${current_mc:,.0f} at or below "
+                f"the ${ABSOLUTE_FLOOR_MC:,.0f} dead-coin threshold",
+                current_mc, "absolute_floor",
+            )
+        ]
 
     # The peak drives the trailing stop, so it is tracked on every check
     # regardless of whether anything else triggers.

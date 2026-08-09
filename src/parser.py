@@ -139,7 +139,7 @@ def parse_call(text):
 
     # Ticker and display name, e.g. "$THESIS (I like the coin)".
     # The name can contain spaces, so it is captured non-greedily.
-    name_match = re.search(r"\$([A-Za-z0-9_]+)\s*\((.+?)\)", text)
+    name_match = re.search(r"\$(\w+)\s*\((.+?)\)", text)
     result["ticker"] = name_match.group(1) if name_match else None
     result["token_name"] = name_match.group(2) if name_match else None
 
@@ -204,7 +204,7 @@ def parse_multiplier_update(text):
     """
     result = {"message_type": "multiplier_update", "raw_text": text}
 
-    header = re.search(r"\$([A-Za-z0-9_]+)\s+x(\d+)", text)
+    header = re.search(r"\$(\w+)\s+x(\d+)", text)
     result["ticker"] = header.group(1) if header else None
     result["multiplier"] = int(header.group(2)) if header else None
 
@@ -235,7 +235,7 @@ def parse_whale_update(text):
     result = {"message_type": "whale_update", "raw_text": text}
 
     match = re.search(
-        r"\$([A-Za-z0-9_]+)\s+whale bought\s+([\d.]+)\s*SOL\s*@\s*\$([\d.]+)\s*([KMB])?",
+        r"\$(\w+)\s+whale bought\s+([\d.]+)\s*SOL\s*@\s*\$([\d.]+)\s*([KMB])?",
         text,
     )
     if match:

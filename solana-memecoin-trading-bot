@@ -1,0 +1,895 @@
+warning: in the working copy of 'src/entry_logic.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/runner.py', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/src/entry_logic.py b/src/entry_logic.py[m
+[1mindex 5574cc8..3e45fb1 100644[m
+[1m--- a/src/entry_logic.py[m
+[1m+++ b/src/entry_logic.py[m
+[36m@@ -27,7 +27,7 @@[m [mStructure of the PCR:[m
+ # --- Position sizing -------------------------------------------------------[m
+ MIN_LOT_SOL = 0.2          # total committed to a call at PCR = 0[m
+ MAX_LOT_SOL = 0.5          # total committed to a call at PCR = 1[m
+[31m-MIN_BUY_SOL = 0.15         # smallest permitted individual buy transaction[m
+[32m+[m[32mMIN_BUY_SOL = 0.10         # smallest permitted individual buy transaction[m
+ MAX_TRANCHES = 3           # most buys a single call may be split across[m
+ [m
+ # --- Weights (must sum to 1.0) ---------------------------------------------[m
+[36m@@ -93,9 +93,21 @@[m [mPCR_STRETCH_LO = 0.10[m
+ PCR_STRETCH_HI = 0.60[m
+ [m
+ # --- DCA / multi-buy -------------------------------------------------------[m
+[31m-# Percentage price drop between tranches. Trigger logic is still provisional -[m
+[31m-# see spec section 5b. The sizing below is usable; the triggers are not final.[m
+[31m-DCA_DROP_STEP_PCT = 15[m
+[32m+[m[32m# Price drop, measured from the PREVIOUS fill (not from the first buy), that[m
+[32m+[m[32m# triggers the next tranche. Buy 3 therefore fires roughly 19% below buy 1,[m
+[32m+[m[32m# not 20%.[m
+[32m+[m[32mDCA_DROP_STEP_PCT = 10[m
+[32m+[m
+[32m+[m[32m# Share of the total lot committed at each stage.[m
+[32m+[m[32m#[m
+[32m+[m[32m# The shape is deliberate: buy 1 is a probe made before the coin has proved[m
+[32m+[m[32m# anything, buy 2 is the largest commitment because the price has improved[m
+[32m+[m[32m# while the thesis is still intact, and buy 3 is slightly smaller again[m
+[32m+[m[32m# because a second consecutive drop raises the odds the call is simply wrong.[m
+[32m+[m[32m#[m
+[32m+[m[32m# Both sets must sum to 1.0.[m
+[32m+[m[32mDCA_WEIGHTS_THREE = (0.30, 0.38, 0.32)[m
+[32m+[m[32mDCA_WEIGHTS_TWO = (0.45, 0.55)[m
+ [m
+ [m
+ # ==========================================================================[m
+[36m@@ -264,47 +276,56 @@[m [mdef pcr_to_lot_size(pcr):[m
+ [m
+ def split_into_tranches(total_sol):[m
+     """[m
+[31m-    Splits a total position size into individual buys.[m
+[32m+[m[32m    Splits a total position size into staged buys.[m
+ [m
+[31m-    The first tranche is the minimum permitted buy, so the smallest possible[m
+[31m-    amount is committed before the price has moved. Whatever remains is spread[m
+[31m-    evenly across the remaining tranches.[m
+[32m+[m[32m    Tries a three-stage split first, falling back to two stages and then to a[m
+[32m+[m[32m    single buy. The deciding constraint is MIN_BUY_SOL: a split is only used if[m
+[32m+[m[32m    EVERY tranche it produces clears that floor, because a plan whose first buy[m
+[32m+[m[32m    is too small to execute is not a plan.[m
+ [m
+[31m-    A total that cannot be divided without breaching MIN_BUY_SOL is returned[m
+[31m-    as a single buy - a low-conviction call may legitimately end up as one[m
+[31m-    transaction simply because it is too small to split.[m
+[31m-[m
+[31m-    NOTE: the drop percentages that trigger later tranches are still[m
+[31m-    provisional (see spec section 5b). The sizes below are usable; the timing[m
+[31m-    rules are not yet final.[m
+[32m+[m[32m    Consequence worth understanding: low-conviction calls naturally end up as a[m
+[32m+[m[32m    single buy, because their total is too small to divide. Staged entry is[m
+[32m+[m[32m    therefore something the strategy earns through conviction rather than[m
+[32m+[m[32m    applies uniformly.[m
+     """[m
+     total_sol = round(total_sol, 4)[m
+ [m
+[31m-    count = min(int(total_sol // MIN_BUY_SOL), MAX_TRANCHES)[m
+[31m-    if count <= 1:[m
+[31m-        return [{"sol": total_sol, "trigger": "immediate", "drop_pct": 0}][m
+[31m-[m
+[31m-    tranches = [{"sol": MIN_BUY_SOL, "trigger": "immediate", "drop_pct": 0}][m
+[31m-[m
+[31m-    remaining = total_sol - MIN_BUY_SOL[m
+[31m-    per_tranche = remaining / (count - 1)[m
+[31m-[m
+[31m-    for i in range(1, count):[m
+[31m-        drop = DCA_DROP_STEP_PCT * i[m
+[31m-        tranches.append([m
+[31m-            {[m
+[31m-                "sol": round(per_tranche, 4),[m
+[31m-                "trigger": f"price drops {drop}% from entry",[m
+[31m-                "drop_pct": drop,[m
+[31m-            }[m
+[31m-        )[m
+[31m-[m
+[31m-    # Rounding can leave a few lamports unallocated; add them to the last buy[m
+[31m-    # so the tranches always sum exactly to the intended total.[m
+[31m-    allocated = sum(t["sol"] for t in tranches)[m
+[31m-    tranches[-1]["sol"] = round(tranches[-1]["sol"] + (total_sol - allocated), 4)[m
+[31m-[m
+[31m-    return tranches[m
+[32m+[m[32m    for weights in (DCA_WEIGHTS_THREE, DCA_WEIGHTS_TWO):[m
+[32m+[m[32m        amounts = [total_sol * w for w in weights][m
+[32m+[m
+[32m+[m[32m        # Tolerance guards against floating point noise at the boundary.[m
+[32m+[m[32m        if all(a >= MIN_BUY_SOL - 1e-9 for a in amounts):[m
+[32m+[m[32m            tranches = [][m
+[32m+[m[32m            for i, amount in enumerate(amounts):[m
+[32m+[m[32m                if i == 0:[m
+[32m+[m[32m                    trigger = "immediate"[m
+[32m+[m[32m                    drop = 0[m
+[32m+[m[32m                else:[m
+[32m+[m[32m                    drop = DCA_DROP_STEP_PCT[m
+[32m+[m[32m                    trigger = f"{drop}% below buy {i} fill price"[m
+[32m+[m[32m                tranches.append([m
+[32m+[m[32m                    {[m
+[32m+[m[32m                        "stage": i + 1,[m
+[32m+[m[32m                        "sol": round(amount, 4),[m
+[32m+[m[32m                        "trigger": trigger,[m
+[32m+[m[32m                        "drop_pct_from_previous_fill": drop,[m
+[32m+[m[32m                    }[m
+[32m+[m[32m                )[m
+[32m+[m
+[32m+[m[32m            # Rounding can leave a few lamports unallocated; the residue goes on[m
+[32m+[m[32m            # the final tranche so the stages always sum to the intended total.[m
+[32m+[m[32m            residue = total_sol - sum(t["sol"] for t in tranches)[m
+[32m+[m[32m            tranches[-1]["sol"] = round(tranches[-1]["sol"] + residue, 4)[m
+[32m+[m[32m            return tranches[m
+[32m+[m
+[32m+[m[32m    return [[m
+[32m+[m[32m        {[m
+[32m+[m[32m            "stage": 1,[m
+[32m+[m[32m            "sol": total_sol,[m
+[32m+[m[32m            "trigger": "immediate",[m
+[32m+[m[32m            "drop_pct_from_previous_fill": 0,[m
+[32m+[m[32m        }[m
+[32m+[m[32m    ][m
+ [m
+ [m
+ # ==========================================================================[m
+[36m@@ -426,4 +447,4 @@[m [mdef _run_self_test():[m
+ [m
+ [m
+ if __name__ == "__main__":[m
+[31m-    _run_self_test()[m
+\ No newline at end of file[m
+[32m+[m[32m    _run_self_test()[m
+[1mdiff --git a/src/exit_logic.py b/src/exit_logic.py[m
+[1mindex 27ad4a3..d0a7e3b 100644[m
+[1m--- a/src/exit_logic.py[m
+[1m+++ b/src/exit_logic.py[m
+[36m@@ -1,3 +1,5 @@[m
+[32m+[m
+[32m+[m[32mExit logic · PY[m
+ """[m
+ exit_logic.py - Stage 3 of the Solana memecoin signal trading bot.[m
+ [m
+[36m@@ -62,6 +64,21 @@[m [mLADDER_STEP_LARGE = 100_000[m
+ # intended behaviour - clipping every 5% at a $2M market cap is over-trading.[m
+ MIN_GAP_BETWEEN_SELLS = 0.10[m
+ [m
+[32m+[m[32m# --- Absolute floor ----------------------------------------------------[m
+[32m+[m[32m# Below this market cap, a position is treated as effectively dead regardless[m
+[32m+[m[32m# of entry price, average cost, or how much DCA has occurred. This exists[m
+[32m+[m[32m# because the ordinary stop-loss is measured against average entry - after a[m
+[32m+[m[32m# multi-stage DCA fill, average entry falls with each buy, which pulls the[m
+[32m+[m[32m# stop-loss trigger down too. A coin DCA'd to a $15K average entry has its[m
+[32m+[m[32m# 55% stop-loss sitting around $6,750, meaning the position could keep[m
+[32m+[m[32m# bleeding well past the point it is realistically dead. This floor overrides[m
+[32m+[m[32m# that calculation entirely: any open position, in any state, is closed[m
+[32m+[m[32m# immediately if market cap falls below it.[m
+[32m+[m[32m#[m
+[32m+[m[32m# Checked BEFORE stop-loss and trailing-stop logic, and applies regardless of[m
+[32m+[m[32m# whether initials have been taken.[m
+[32m+[m[32mABSOLUTE_FLOOR_MC = 9_000[m
+[32m+[m
+ # --- Loss limits -----------------------------------------------------------[m
+ # Applies only before initials are taken, measured against average entry.[m
+ STOP_LOSS_DRAWDOWN = 0.55[m
+[36m@@ -255,6 +272,22 @@[m [mdef check_exit_conditions(position, current_mc, now):[m
+     if position["closed"]:[m
+         return [][m
+ [m
+[32m+[m[32m    # Absolute floor. Checked before anything else, and independent of[m
+[32m+[m[32m    # whether initials have been taken - this is a hard override, not part[m
+[32m+[m[32m    # of the normal stop-loss/trailing-stop decision tree. No confirmation[m
+[32m+[m[32m    # delay, for the same reason as the stop-loss: on the way down, waiting[m
+[32m+[m[32m    # only costs money.[m
+[32m+[m[32m    if current_mc <= ABSOLUTE_FLOOR_MC:[m
+[32m+[m[32m        _clear_pending(position)[m
+[32m+[m[32m        return [[m
+[32m+[m[32m            _sell([m
+[32m+[m[32m                position, 1.0,[m
+[32m+[m[32m                f"absolute floor: market cap ${current_mc:,.0f} at or below "[m
+[32m+[m[32m                f"the ${ABSOLUTE_FLOOR_MC:,.0f} dead-coin threshold",[m
+[32m+[m[32m                current_mc, "absolute_floor",[m
+[32m+[m[32m            )[m
+[32m+[m[32m        ][m
+[32m+[m
+     # The peak drives the trailing stop, so it is tracked on every check[m
+     # regardless of whether anything else triggers.[m
+     if current_mc > position["peak_mc"]:[m
+[36m@@ -456,4 +489,28 @@[m [mdef _run_self_test():[m
+ [m
+ [m
+ if __name__ == "__main__":[m
+[31m-    _run_self_test()[m
+\ No newline at end of file[m
+[32m+[m[32m    _run_self_test()[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[1mdiff --git a/src/parser.py b/src/parser.py[m
+[1mindex d5f29d3..6a3f4e6 100644[m
+[1m--- a/src/parser.py[m
+[1m+++ b/src/parser.py[m
+[36m@@ -139,7 +139,7 @@[m [mdef parse_call(text):[m
+ [m
+     # Ticker and display name, e.g. "$THESIS (I like the coin)".[m
+     # The name can contain spaces, so it is captured non-greedily.[m
+[31m-    name_match = re.search(r"\$([A-Za-z0-9_]+)\s*\((.+?)\)", text)[m
+[32m+[m[32m    name_match = re.search(r"\$(\w+)\s*\((.+?)\)", text)[m
+     result["ticker"] = name_match.group(1) if name_match else None[m
+     result["token_name"] = name_match.group(2) if name_match else None[m
+ [m
+[36m@@ -204,7 +204,7 @@[m [mdef parse_multiplier_update(text):[m
+     """[m
+     result = {"message_type": "multiplier_update", "raw_text": text}[m
+ [m
+[31m-    header = re.search(r"\$([A-Za-z0-9_]+)\s+x(\d+)", text)[m
+[32m+[m[32m    header = re.search(r"\$(\w+)\s+x(\d+)", text)[m
+     result["ticker"] = header.group(1) if header else None[m
+     result["multiplier"] = int(header.group(2)) if header else None[m
+ [m
+[36m@@ -235,7 +235,7 @@[m [mdef parse_whale_update(text):[m
+     result = {"message_type": "whale_update", "raw_text": text}[m
+ [m
+     match = re.search([m
+[31m-        r"\$([A-Za-z0-9_]+)\s+whale bought\s+([\d.]+)\s*SOL\s*@\s*\$([\d.]+)\s*([KMB])?",[m
+[32m+[m[32m        r"\$(\w+)\s+whale bought\s+([\d.]+)\s*SOL\s*@\s*\$([\d.]+)\s*([KMB])?",[m
+         text,[m
+     )[m
+     if match:[m
+[1mdiff --git a/src/runner.py b/src/runner.py[m
+[1mindex b14ba05..1f73423 100644[m
+[1m--- a/src/runner.py[m
+[1m+++ b/src/runner.py[m
+[36m@@ -1,6 +1,7 @@[m
+[32m+[m
+ """[m
+ runner.py - Stage 3 dry run. Connects every component into a working pipeline.[m
+[31m-[m
+[32m+[m[41m [m
+     Telegram message[m
+         -> parser          classify and extract[m
+         -> entry_logic     buy or reject, and how much[m
+[36m@@ -8,20 +9,20 @@[m [mrunner.py - Stage 3 dry run. Connects every component into a working pipeline.[m
+         -> market_data     market cap polled on a timer[m
+         -> exit_logic      DCA fills, take profit, stop loss[m
+         -> logs[m
+[31m-[m
+[32m+[m[41m [m
+ NOTHING IS TRADED. No wallet is loaded, no key is read, no transaction is[m
+ built. Every fill below is simulated at the market cap observed at that[m
+ moment. DRY_RUN exists as a switch so that live execution can be added later[m
+ without restructuring, but it is not yet wired to anything that could spend.[m
+[31m-[m
+[32m+[m[41m [m
+ Two things run at once: the Telegram listener, which reacts to messages as[m
+ they arrive, and the position monitor, which polls on a timer. Python's[m
+ asyncio runs both in a single process, each pausing while it waits so the[m
+ other can proceed.[m
+[31m-[m
+[32m+[m[41m [m
+     python src/runner.py[m
+ """[m
+[31m-[m
+[32m+[m[41m [m
+ import asyncio[m
+ import json[m
+ import logging[m
+[36m@@ -29,56 +30,56 @@[m [mimport os[m
+ import time[m
+ from datetime import datetime, timezone[m
+ from pathlib import Path[m
+[31m-[m
+[32m+[m[41m [m
+ import aiohttp[m
+ from dotenv import load_dotenv[m
+ from telethon import TelegramClient, events[m
+[31m-[m
+[32m+[m[41m [m
+ import entry_logic[m
+ import exit_logic[m
+ import market_data[m
+ import parser as message_parser[m
+[31m-[m
+[32m+[m[41m [m
+ # ==========================================================================[m
+ # CONFIGURATION[m
+ # ==========================================================================[m
+[31m-[m
+[32m+[m[41m [m
+ # Hard safety switch. While True the bot only ever writes to logs.[m
+ DRY_RUN = True[m
+[31m-[m
+[32m+[m[41m [m
+ # How often open positions are re-priced, in seconds. One batched request[m
+ # covers every position, so this cost does not grow as positions accumulate.[m
+ POLL_INTERVAL_SECONDS = 5[m
+[31m-[m
+[32m+[m[41m [m
+ # Where simulated state and output are kept. No database yet - see spec[m
+ # section 12; that arrives at Stage 7 alongside the backtesting work.[m
+ LOGS_DIR = Path("logs")[m
+ POSITIONS_FILE = LOGS_DIR / "positions.json"[m
+[31m-[m
+[32m+[m[41m [m
+ # How often a status line is written for each open position. Without this the[m
+ # monitor is silent unless something fails, so there is no way to distinguish[m
+ # "nothing is happening" from "pricing has silently stopped working".[m
+ STATUS_INTERVAL_SECONDS = 300[m
+[31m-[m
+[32m+[m[41m [m
+ # Positions that have closed are kept in the file for later analysis rather[m
+ # than deleted, but are skipped by the monitor.[m
+ load_dotenv()[m
+[31m-[m
+[32m+[m[41m [m
+ API_ID = os.getenv("TELEGRAM_API_ID")[m
+ API_HASH = os.getenv("TELEGRAM_API_HASH")[m
+ CHANNEL = os.getenv("TELEGRAM_CHANNEL")[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ # ==========================================================================[m
+ # LOGGING[m
+ # ==========================================================================[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ def setup_logging():[m
+     """Logs to the console and to a dated file, so nothing is lost overnight."""[m
+     LOGS_DIR.mkdir(exist_ok=True)[m
+     logfile = LOGS_DIR / f"dryrun_{datetime.now(timezone.utc):%Y-%m-%d}.log"[m
+[31m-[m
+[32m+[m[41m [m
+     logging.basicConfig([m
+         level=logging.INFO,[m
+         format="%(asctime)s | %(levelname)-7s | %(message)s",[m
+[36m@@ -87,15 +88,15 @@[m [mdef setup_logging():[m
+                   logging.StreamHandler()],[m
+     )[m
+     return logging.getLogger("runner")[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ log = setup_logging()[m
+[31m-[m
+[32m+[m[41m [m
+ # Telethon logs every connection detail at INFO, which buries the trading[m
+ # output. Warnings and errors still come through.[m
+ logging.getLogger("telethon").setLevel(logging.WARNING)[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ # ==========================================================================[m
+ # POSITION STORE[m
+ #[m
+[36m@@ -103,19 +104,34 @@[m [mlogging.getLogger("telethon").setLevel(logging.WARNING)[m
+ # duplicate-buy protection survives the process dying. Keyed by contract[m
+ # address because that is the only identifier guaranteed unique per token.[m
+ # ==========================================================================[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+[32m+[m[32mdef _migrate_tranches(positions):[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Normalises pending tranches saved by an older entry_logic version.[m
+[32m+[m[41m [m
+[32m+[m[32m    The tranche key was renamed from drop_pct to drop_pct_from_previous_fill[m
+[32m+[m[32m    when DCA was reworked. Positions stored under the old name would crash the[m
+[32m+[m[32m    monitor loop on every cycle, so they are converted here at load time.[m
+[32m+[m[32m    """[m
+[32m+[m[32m    for position in positions.values():[m
+[32m+[m[32m        for tranche in position.get("pending_tranches", []):[m
+[32m+[m[32m            if "drop_pct_from_previous_fill" not in tranche:[m
+[32m+[m[32m                tranche["drop_pct_from_previous_fill"] = tranche.get("drop_pct", 10)[m
+[32m+[m[32m    return positions[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ def load_positions():[m
+     if not POSITIONS_FILE.exists():[m
+         return {}[m
+     try:[m
+         with open(POSITIONS_FILE, encoding="utf-8") as f:[m
+[31m-            return json.load(f)[m
+[32m+[m[32m            return _migrate_tranches(json.load(f))[m
+     except (json.JSONDecodeError, OSError) as exc:[m
+         log.error("Could not read positions file (%s). Starting empty.", exc)[m
+         return {}[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ def save_positions(positions):[m
+     LOGS_DIR.mkdir(exist_ok=True)[m
+     try:[m
+[36m@@ -123,11 +139,11 @@[m [mdef save_positions(positions):[m
+             json.dump(positions, f, indent=2)[m
+     except OSError as exc:[m
+         log.error("Could not save positions: %s", exc)[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ POSITIONS = load_positions()[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ # ==========================================================================[m
+ # NOTIONAL ACCOUNTING[m
+ #[m
+[36m@@ -144,13 +160,13 @@[m [mPOSITIONS = load_positions()[m
+ # so taking a simple mean of the fill prices would put the stop-loss in the[m
+ # wrong place.[m
+ # ==========================================================================[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ def tokens_for(sol_amount, fill_mc, reference_mc):[m
+     """Notional token units acquired by spending sol_amount at fill_mc."""[m
+     return sol_amount * (reference_mc / fill_mc)[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ def breakeven_mc(position):[m
+     """The market cap at which the position is exactly flat."""[m
+     if position["tokens_remaining"] <= 0:[m
+[36m@@ -160,32 +176,76 @@[m [mdef breakeven_mc(position):[m
+         * position["reference_mc"][m
+         / position["total_tokens_bought"][m
+     )[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ def position_value_sol(position, current_mc):[m
+     """Current SOL value of what is still held."""[m
+     return position["tokens_remaining"] * (current_mc / position["reference_mc"])[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ # ==========================================================================[m
+ # OPENING A POSITION[m
+ # ==========================================================================[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ async def open_position(decision, call):[m
+     """[m
+     Records a simulated entry and schedules the remaining DCA tranches.[m
+[31m-[m
+[32m+[m[41m [m
+     Only the first tranche fills here. Later stages are stored as pending and[m
+     fill when the price drops far enough - see check_dca_fills.[m
+[32m+[m[41m [m
+[32m+[m[32m    THE FILL PRICE IS THE LIVE MARKET CAP, NOT THE ONE IN THE MESSAGE. The[m
+[32m+[m[32m    figure GemTools prints was measured before the message was composed,[m
+[32m+[m[32m    delivered and parsed; a real buy happens at whatever the price is now.[m
+[32m+[m[32m    Observed gaps have exceeded 25% within a second of a call. Using the[m
+[32m+[m[32m    stale figure inflates P&L and misplaces every exit threshold, so:[m
+[32m+[m[41m [m
+[32m+[m[32m      - the PCR is still scored on the GemTools snapshot (the judgement is[m
+[32m+[m[32m        about the call as made), but[m
+[32m+[m[32m      - the position's entry is the live price, and[m
+[32m+[m[32m      - the live price is re-checked against the hard cut, so a coin that[m
+[32m+[m[32m        has already run past $75K by the time the message arrives cannot[m
+[32m+[m[32m        slip in under its stale figure.[m
+[32m+[m[41m [m
+[32m+[m[32m    If no live price is available (very new tokens are sometimes not yet[m
+[32m+[m[32m    indexed), the call figure is used as a fallback and flagged in the log.[m
+     """[m
+     contract = decision["contract_address"][m
+     tranches = decision["tranches"][m
+     first = tranches[0][m
+[31m-    entry_mc = call["market_cap"][m
+[31m-[m
+[32m+[m[32m    call_mc = call["market_cap"][m
+[32m+[m[41m [m
+[32m+[m[32m    live_mc = None[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        async with aiohttp.ClientSession() as session:[m
+[32m+[m[32m            caps = await market_data.fetch_market_caps(session, [contract])[m
+[32m+[m[32m        live_mc = caps.get(contract)[m
+[32m+[m[32m    except aiohttp.ClientError as exc:[m
+[32m+[m[32m        log.warning("Live price fetch failed for %s: %s", decision["ticker"], exc)[m
+[32m+[m[41m [m
+[32m+[m[32m    if live_mc is not None:[m
+[32m+[m[32m        if live_mc >= entry_logic.MC_HARD_CUT:[m
+[32m+[m[32m            log.info([m
+[32m+[m[32m                "REJECT %-9s live $%s (call said $%s)  | above hard cut at fill time",[m
+[32m+[m[32m                decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}",[m
+[32m+[m[32m            )[m
+[32m+[m[32m            return[m
+[32m+[m[32m        entry_mc = live_mc[m
+[32m+[m[32m        gap_pct = (live_mc / call_mc - 1) * 100[m
+[32m+[m[32m        log.info([m
+[32m+[m[32m            "FILL  %-10s live $%s vs call $%s  (gap %+.1f%%)",[m
+[32m+[m[32m            decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}", gap_pct,[m
+[32m+[m[32m        )[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        entry_mc = call_mc[m
+[32m+[m[32m        log.warning([m
+[32m+[m[32m            "FILL  %-10s no live price - falling back to call figure $%s",[m
+[32m+[m[32m            decision["ticker"], f"{call_mc:,.0f}",[m
+[32m+[m[32m        )[m
+[32m+[m[41m [m
+     tokens = tokens_for(first["sol"], entry_mc, entry_mc)[m
+[31m-[m
+[32m+[m[41m [m
+     position = {[m
+         "ticker": decision["ticker"],[m
+         "contract_address": contract,[m
+[36m@@ -193,6 +253,7 @@[m [masync def open_position(decision, call):[m
+         # Accounting[m
+         "reference_mc": entry_mc,[m
+         "entry_mc": entry_mc,[m
+[32m+[m[32m        "call_mc": call_mc,[m
+         "sol_invested": first["sol"],[m
+         "total_tokens_bought": tokens,[m
+         "tokens_remaining": tokens,[m
+[36m@@ -220,10 +281,10 @@[m [masync def open_position(decision, call):[m
+         "pending": None,[m
+         "realised_sol": 0.0,[m
+     }[m
+[31m-[m
+[32m+[m[41m [m
+     POSITIONS[contract] = position[m
+     save_positions(POSITIONS)[m
+[31m-[m
+[32m+[m[41m [m
+     log.info([m
+         "OPEN  %-10s $%s  PCR %.3f  buy 1/%d: %.3f SOL of %.3f planned",[m
+         decision["ticker"], f"{entry_mc:,.0f}", decision["pcr"],[m
+[36m@@ -231,43 +292,56 @@[m [masync def open_position(decision, call):[m
+     )[m
+     if tranches[1:]:[m
+         upcoming = ", ".join([m
+[31m-            f"{t['sol']:.3f} SOL at -{t['drop_pct_from_previous_fill']}%"[m
+[32m+[m[32m            f"{t['sol']:.3f} SOL at "[m
+[32m+[m[32m            f"-{t.get('drop_pct_from_previous_fill', t.get('drop_pct', '?'))}%"[m
+             for t in tranches[1:][m
+         )[m
+         log.info("      pending tranches: %s", upcoming)[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ # ==========================================================================[m
+ # DCA FILLS[m
+ # ==========================================================================[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ def check_dca_fills(position, current_mc):[m
+     """[m
+     Fills the next pending tranche if the price has dropped far enough.[m
+[31m-[m
+[32m+[m[41m [m
+     Each drop is measured from the PREVIOUS fill rather than cumulatively from[m
+     the first buy, so a three-stage entry completes around 19% below buy 1[m
+     rather than 20%.[m
+[31m-[m
+[32m+[m[41m [m
+     DCA stops once initials have been taken. Past that point the position is[m
+     being wound down, and adding to it would contradict the exit that is[m
+     already in progress.[m
+     """[m
+     if position["initials_taken"] or not position["pending_tranches"]:[m
+         return None[m
+[31m-[m
+[32m+[m[41m [m
+     next_tranche = position["pending_tranches"][0][m
+[31m-    drop = next_tranche["drop_pct_from_previous_fill"] / 100.0[m
+[32m+[m[32m    drop_pct = next_tranche.get([m
+[32m+[m[32m        "drop_pct_from_previous_fill", next_tranche.get("drop_pct")[m
+[32m+[m[32m    )[m
+[32m+[m[32m    if drop_pct is None:[m
+[32m+[m[32m        # An unrecognised tranche format - refuse to guess a trigger for it.[m
+[32m+[m[32m        log.warning([m
+[32m+[m[32m            "DCA tranche for %s has no drop percentage - skipping it. "[m
+[32m+[m[32m            "src/entry_logic.py is likely an outdated version.",[m
+[32m+[m[32m            position["ticker"],[m
+[32m+[m[32m        )[m
+[32m+[m[32m        position["pending_tranches"].pop(0)[m
+[32m+[m[32m        return None[m
+[32m+[m[32m    drop = drop_pct / 100.0[m
+     trigger_mc = position["last_fill_mc"] * (1 - drop)[m
+[31m-[m
+[32m+[m[41m [m
+     if current_mc > trigger_mc:[m
+         return None[m
+[31m-[m
+[32m+[m[41m [m
+     # Fill it.[m
+     position["pending_tranches"].pop(0)[m
+     tokens = tokens_for(next_tranche["sol"], current_mc, position["reference_mc"])[m
+[31m-[m
+[32m+[m[41m [m
+     position["sol_invested"] += next_tranche["sol"][m
+     position["total_tokens_bought"] += tokens[m
+     position["tokens_remaining"] += tokens[m
+[36m@@ -277,23 +351,23 @@[m [mdef check_dca_fills(position, current_mc):[m
+         {"stage": next_tranche["stage"], "sol": next_tranche["sol"],[m
+          "mc": current_mc, "at": datetime.now(timezone.utc).isoformat()}[m
+     )[m
+[31m-[m
+[32m+[m[41m [m
+     # Averaging down moves break-even, which moves every exit threshold with it.[m
+     position["entry_mc"] = breakeven_mc(position)[m
+[31m-[m
+[32m+[m[41m [m
+     return {[m
+         "stage": next_tranche["stage"],[m
+         "sol": next_tranche["sol"],[m
+         "mc": current_mc,[m
+         "new_entry_mc": position["entry_mc"],[m
+     }[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ # ==========================================================================[m
+ # MONITOR LOOP[m
+ # ==========================================================================[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ async def monitor_positions():[m
+     """Re-prices every open position on a timer and applies the exit rules."""[m
+     async with aiohttp.ClientSession() as session:[m
+[36m@@ -307,25 +381,25 @@[m [masync def monitor_positions():[m
+                 log.warning("Market data request failed: %s", exc)[m
+             except Exception:[m
+                 log.exception("Unexpected error in monitor loop")[m
+[31m-[m
+[32m+[m[41m [m
+             await asyncio.sleep(POLL_INTERVAL_SECONDS)[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ # Timestamp of the last status heartbeat.[m
+ _last_status_at = 0.0[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ async def _monitor_once(session):[m
+     global _last_status_at[m
+[31m-[m
+[32m+[m[41m [m
+     open_positions = {k: v for k, v in POSITIONS.items() if not v["closed"]}[m
+     if not open_positions:[m
+         return[m
+[31m-[m
+[32m+[m[41m [m
+     market_caps = await market_data.fetch_market_caps(session, list(open_positions))[m
+     now = time.time()[m
+     changed = False[m
+[31m-[m
+[32m+[m[41m [m
+     # Periodic proof of life. Also surfaces positions the API has stopped[m
+     # returning data for, which is itself a meaningful signal - a token that[m
+     # has vanished from Jupiter is usually one with no liquidity left.[m
+[36m@@ -343,12 +417,12 @@[m [masync def _monitor_once(session):[m
+                 position["ticker"], f"{mc:,.0f}", f"{position['entry_mc']:,.0f}",[m
+                 value, pnl,[m
+             )[m
+[31m-[m
+[32m+[m[41m [m
+     for contract, position in open_positions.items():[m
+         current_mc = market_caps.get(contract)[m
+         if current_mc is None:[m
+             continue[m
+[31m-[m
+[32m+[m[41m [m
+         fill = check_dca_fills(position, current_mc)[m
+         if fill:[m
+             changed = True[m
+[36m@@ -357,19 +431,19 @@[m [masync def _monitor_once(session):[m
+                 position["ticker"], fill["stage"], fill["sol"],[m
+                 f"{fill['mc']:,.0f}", f"{fill['new_entry_mc']:,.0f}",[m
+             )[m
+[31m-[m
+[32m+[m[41m [m
+         for action in exit_logic.check_exit_conditions(position, current_mc, now):[m
+             changed = True[m
+             proceeds = action["tokens"] * (current_mc / position["reference_mc"])[m
+             position["realised_sol"] += proceeds[m
+[31m-[m
+[32m+[m[41m [m
+             log.info([m
+                 "SELL  %-10s %-13s %.1f%% at $%s  -> %.4f SOL  | %s",[m
+                 position["ticker"], action["exit_type"],[m
+                 action["pct_of_original_position"], f"{current_mc:,.0f}",[m
+                 proceeds, action["reason"],[m
+             )[m
+[31m-[m
+[32m+[m[41m [m
+             if action["position_closed"]:[m
+                 pnl = position["realised_sol"] - position["sol_invested"][m
+                 log.info([m
+[36m@@ -378,78 +452,98 @@[m [masync def _monitor_once(session):[m
+                     position["realised_sol"], pnl,[m
+                     pnl / position["sol_invested"] * 100,[m
+                 )[m
+[31m-[m
+[32m+[m[41m [m
+     if changed:[m
+         save_positions(POSITIONS)[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ # ==========================================================================[m
+ # TELEGRAM HANDLING[m
+ # ==========================================================================[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ client = TelegramClient("bot_session", int(API_ID or 0), API_HASH or "")[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ @client.on(events.NewMessage(chats=CHANNEL))[m
+ async def on_message(event):[m
+     text = event.message.raw_text[m
+     if not text:[m
+         return[m
+[31m-[m
+[32m+[m[41m [m
+     parsed = message_parser.parse_message(text)[m
+     kind = parsed["message_type"][m
+[31m-[m
+[32m+[m[41m [m
+     if kind != "call":[m
+         # Updates are logged only. They are the raw material for the whale-buy[m
+         # regression described in spec section 13, so they are worth capturing[m
+         # even though nothing acts on them yet.[m
+[32m+[m[32m        #[m
+[32m+[m[32m        # TEMPORARY DEBUG: some multiplier updates ("Just did xN" format) have[m
+[32m+[m[32m        # no ticker, and the parser currently returns nothing for them. This[m
+[32m+[m[32m        # branch captures the raw text of any such case so parser.py can be[m
+[32m+[m[32m        # fixed against the real format instead of a guess. Remove once fixed.[m
+         if kind != "unknown":[m
+[31m-            log.info("UPDATE %-9s %s", parsed.get("ticker") or "", kind)[m
+[32m+[m[32m            if not parsed.get("ticker"):[m
+[32m+[m[32m                log.warning([m
+[32m+[m[32m                    "UPDATE MISSING TICKER | raw: %s",[m
+[32m+[m[32m                    text[:150].replace("\n", " "),[m
+[32m+[m[32m                )[m
+[32m+[m[32m            else:[m
+[32m+[m[32m                log.info("UPDATE %-9s %s", parsed.get("ticker"), kind)[m
+         return[m
+[31m-[m
+[32m+[m[41m [m
+     if not parsed["parse_ok"]:[m
+         log.warning("PARSE FAIL  missing %s | %s",[m
+                     parsed["missing_fields"], text[:60].replace("\n", " "))[m
+         return[m
+[31m-[m
+[32m+[m[41m [m
+     contract = parsed["contract_address"][m
+[31m-[m
+[32m+[m[41m [m
+     # Duplicate protection. A channel repost or a reconnect that redelivers a[m
+     # message must not open a second position in the same token.[m
+     if contract in POSITIONS:[m
+         log.info("SKIP  %-10s already held or previously traded", parsed["ticker"])[m
+         return[m
+[31m-[m
+[32m+[m[41m [m
+     decision = entry_logic.decide_entry(parsed)[m
+[31m-[m
+[32m+[m[41m [m
+     if decision["action"] == "reject":[m
+         log.info("REJECT %-9s $%s  | %s", parsed["ticker"],[m
+                  f"{parsed['market_cap']:,.0f}", decision["reason"])[m
+         return[m
+[31m-[m
+[32m+[m[41m [m
+     await open_position(decision, parsed)[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ # ==========================================================================[m
+ # ENTRY POINT[m
+ # ==========================================================================[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ async def main():[m
+     if not API_ID or not API_HASH or not CHANNEL:[m
+         raise SystemExit([m
+             "Missing credentials. Check .env contains TELEGRAM_API_ID, "[m
+             "TELEGRAM_API_HASH and TELEGRAM_CHANNEL."[m
+         )[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[32m    # Guards against running with a mismatched entry_logic version - the[m
+[32m+[m[32m    # exact failure mode that produced a monitor-loop crash on every cycle.[m
+[32m+[m[32m    if getattr(entry_logic, "MIN_BUY_SOL", None) != 0.10:[m
+[32m+[m[32m        log.warning([m
+[32m+[m[32m            "src/entry_logic.py looks OUTDATED (MIN_BUY_SOL=%s, expected 0.1). "[m
+[32m+[m[32m            "DCA tranching will not behave as designed.",[m
+[32m+[m[32m            getattr(entry_logic, "MIN_BUY_SOL", "missing"),[m
+[32m+[m[32m        )[m
+[32m+[m[41m [m
+     log.info("=" * 66)[m
+     log.info("DRY RUN - no wallet loaded, no trades executed")[m
+     log.info("channel: %s | polling every %ss", CHANNEL, POLL_INTERVAL_SECONDS)[m
+     open_count = sum(1 for p in POSITIONS.values() if not p["closed"])[m
+     log.info("restored %d position(s), %d still open", len(POSITIONS), open_count)[m
+     log.info("=" * 66)[m
+[31m-[m
+[32m+[m[41m [m
+     async with client:[m
+         # Both tasks run concurrently: the listener reacts to messages while[m
+         # the monitor polls on its own schedule.[m
+[36m@@ -457,12 +551,29 @@[m [masync def main():[m
+             client.run_until_disconnected(),[m
+             monitor_positions(),[m
+         )[m
+[31m-[m
+[31m-[m
+[32m+[m[41m [m
+[32m+[m[41m [m
+ if __name__ == "__main__":[m
+     if not DRY_RUN:[m
+         raise SystemExit("Live execution is not implemented. Keep DRY_RUN = True.")[m
+     try:[m
+         asyncio.run(main())[m
+     except KeyboardInterrupt:[m
+[31m-        log.info("Stopped by user. %d position(s) saved.", len(POSITIONS))[m
+\ No newline at end of file[m
+[32m+[m[32m        log.info("Stopped by user. %d position(s) saved.", len(POSITIONS))[m
+[41m+ [m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
+[41m+[m
