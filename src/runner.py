@@ -314,8 +314,26 @@ def check_dca_fills(position, current_mc):
     DCA stops once initials have been taken. Past that point the position is
     being wound down, and adding to it would contradict the exit that is
     already in progress.
+
+    DCA also stops at the absolute floor. The floor check inside exit_logic
+    runs first within that function, but this function is called BEFORE it in
+    the monitor cycle - so without the guard below, a position sitting under
+    the floor would take one more tranche and then be sold at the same price
+    microseconds later. In a dry run that only distorts the log; live it is
+    real capital committed to a position already being closed, plus a wasted
+    swap fee. The floor value is read from exit_logic so there is one
+    definition of "dead" rather than two that can drift apart.
     """
     if position["initials_taken"] or not position["pending_tranches"]:
+        return None
+
+    if current_mc <= exit_logic.ABSOLUTE_FLOOR_MC:
+        log.info(
+            "DCA   %-10s skipped: $%s is at or below the $%s floor, "
+            "position is closing",
+            position["ticker"], f"{current_mc:,.0f}",
+            f"{exit_logic.ABSOLUTE_FLOOR_MC:,.0f}",
+        )
         return None
 
     next_tranche = position["pending_tranches"][0]
