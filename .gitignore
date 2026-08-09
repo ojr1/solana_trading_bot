@@ -8,5 +8,10 @@ venv/
 __pycache__/
 *.pyc
 
-# Logs
+# Logs and trading data - your history, not source code
 logs/
+data/
+
+# Stray terminal output
+*.diff
+*.patch
