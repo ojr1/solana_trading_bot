@@ -100,14 +100,27 @@ DCA_DROP_STEP_PCT = 10
 
 # Share of the total lot committed at each stage.
 #
-# The shape is deliberate: buy 1 is a probe made before the coin has proved
-# anything, buy 2 is the largest commitment because the price has improved
-# while the thesis is still intact, and buy 3 is slightly smaller again
-# because a second consecutive drop raises the odds the call is simply wrong.
+# FRONT-LOADED, revised after the 10 Aug overnight run. The previous shape
+# (0.30/0.38/0.32) put the largest commitment on buy 2, on the reasoning that
+# a dip with the thesis intact is the better price. The data said otherwise:
+# coins that ran never dipped 10%, so six of twelve winners filled tranche 1
+# only and were taken at roughly a third of intended size, while nearly every
+# loser filled all three tranches on the way down and lost the full lot.
+#
+# Buy 1 is now the largest because it is the only tranche a winner is
+# guaranteed to fill. The later stages are kept - removing DCA entirely tested
+# WORSE, because the dip fills lowered average entry enough for Laeula, DOGE
+# and SOUTHPARK to reach their initials trigger at all - but they are now
+# smaller, so a coin in freefall commits less.
 #
 # Both sets must sum to 1.0.
-DCA_WEIGHTS_THREE = (0.30, 0.38, 0.32)
-DCA_WEIGHTS_TWO = (0.45, 0.55)
+#
+# Note the side effect: with a 0.25 minimum weight, a three-stage split now
+# requires a lot of at least 0.40 SOL (0.40 x 0.25 = MIN_BUY_SOL). Lots below
+# that fall to the two-stage split, and below 0.25 SOL to a single buy. That
+# is intended - staged entry is earned by conviction.
+DCA_WEIGHTS_THREE = (0.45, 0.30, 0.25)
+DCA_WEIGHTS_TWO = (0.60, 0.40)
 
 
 # ==========================================================================
@@ -420,7 +433,46 @@ _TEST_CALLS = [
 ]
 
 
+def _check_dca_weights():
+    """
+    Guards the front-loaded DCA shape against a bad edit.
+
+    Both weight sets must sum to 1.0, and buy 1 must be the largest tranche -
+    that is the whole point of the 10 Aug revision, and it is easy to undo by
+    accident when tuning the numbers.
+    """
+    problems = []
+
+    for name, weights in (("DCA_WEIGHTS_THREE", DCA_WEIGHTS_THREE),
+                          ("DCA_WEIGHTS_TWO", DCA_WEIGHTS_TWO)):
+        total = sum(weights)
+        if abs(total - 1.0) > 1e-9:
+            problems.append(f"{name} sums to {total:.4f}, not 1.0")
+        if weights[0] != max(weights):
+            problems.append(
+                f"{name} is not front-loaded: buy 1 is {weights[0]}, "
+                f"largest is {max(weights)}"
+            )
+
+    print("=" * 70)
+    print("DCA WEIGHT CHECK")
+    print("-" * 70)
+    if problems:
+        for p in problems:
+            print(f"  FAIL  {p}")
+    else:
+        print(f"  OK  three-stage {DCA_WEIGHTS_THREE}  sums to 1.0, front-loaded")
+        print(f"  OK  two-stage   {DCA_WEIGHTS_TWO}  sums to 1.0, front-loaded")
+        three_min = MIN_BUY_SOL / min(DCA_WEIGHTS_THREE)
+        two_min = MIN_BUY_SOL / min(DCA_WEIGHTS_TWO)
+        print(f"  three-stage needs a lot of at least {three_min:.3f} SOL")
+        print(f"  two-stage   needs a lot of at least {two_min:.3f} SOL")
+    print()
+
+
 def _run_self_test():
+    _check_dca_weights()
+
     for call in _TEST_CALLS:
         label = call.pop("label")
         print("=" * 70)
