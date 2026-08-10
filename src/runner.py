@@ -39,6 +39,7 @@ import entry_logic
 import exit_logic
 import market_data
 import parser as message_parser
+import trading_window
 
 # ==========================================================================
 # CONFIGURATION
@@ -60,6 +61,34 @@ POSITIONS_FILE = LOGS_DIR / "positions.json"
 # monitor is silent unless something fails, so there is no way to distinguish
 # "nothing is happening" from "pricing has silently stopped working".
 STATUS_INTERVAL_SECONDS = 300
+
+# ---------------------------------------------------------------------------
+# ENTRY GUARDS (added 10 Aug 2026 after the first full overnight run)
+#
+# The hard cut at $75K protects against buying a coin that has already run.
+# These three protect against the opposite and adjacent failures, each of
+# which cost real money in the 10 Aug session:
+#
+#   Shaboingdog  opened at $5,221 against a call figure of $20,400 - a 74%
+#                gap, and already below the absolute floor. It was bought and
+#                floor-sold within the same cycle.
+#   ALING        opened and floor-closed three times in eight minutes for a
+#                combined -0.665 SOL. Duplicate protection is keyed on
+#                contract address, so a relaunch under the same ticker is a
+#                different contract and slipped straight through.
+# ---------------------------------------------------------------------------
+
+# Reject a fill if the live market cap has fallen more than this far below the
+# figure quoted in the call. Mirrors the $75K hard cut on the downside: a coin
+# that has collapsed since the message was composed is not the coin that was
+# called, whatever the PCR scored it at.
+MAX_ENTRY_GAP_PCT = 35
+
+# After a position in a ticker closes at a loss, block new entries in that
+# same ticker name for this long. Keyed on TICKER deliberately, because a
+# relaunch has a new contract address and would otherwise defeat the existing
+# contract-keyed duplicate check.
+LOSS_COOLDOWN_MINUTES = 60
 
 # Positions that have closed are kept in the file for later analysis rather
 # than deleted, but are skipped by the monitor.
@@ -142,6 +171,64 @@ def save_positions(positions):
 
 
 POSITIONS = load_positions()
+
+
+def ticker_cooldown_remaining(ticker):
+    """
+    Minutes left on the loss cooldown for this ticker, or None if clear.
+
+    Scans closed positions for the same ticker name that ended at a net loss
+    within the cooldown period.
+
+    NOTE ON THE RULE: the original design said "after a stop-loss or floor
+    close". This implementation triggers on any close that ended at a net
+    LOSS, which is a superset - it catches stop-loss and floor closes by
+    definition, plus a trailing stop that still ended underwater. It is also
+    robust to the exit_type strings in exit_logic changing, which a hardcoded
+    list of names would not be. If you want the narrower rule, the change is
+    one condition below.
+
+    Ticker comparison is case-insensitive because relaunches frequently
+    differ only in capitalisation.
+    """
+    if not ticker:
+        return None
+
+    target = ticker.strip().lower()
+    now = datetime.now(timezone.utc)
+    longest = None
+
+    for position in POSITIONS.values():
+        if not position.get("closed"):
+            continue
+        if (position.get("ticker") or "").strip().lower() != target:
+            continue
+
+        # Net loss check. A position with no realised figure is skipped
+        # rather than guessed at.
+        invested = position.get("sol_invested")
+        realised = position.get("realised_sol")
+        if invested is None or realised is None or realised >= invested:
+            continue
+
+        closed_at = position.get("closed_at")
+        if not closed_at:
+            # Positions closed before closed_at was recorded cannot be timed,
+            # so they cannot hold a cooldown open. Nothing to do.
+            continue
+
+        try:
+            closed_time = datetime.fromisoformat(closed_at)
+        except (TypeError, ValueError):
+            continue
+
+        elapsed_minutes = (now - closed_time).total_seconds() / 60.0
+        if elapsed_minutes < LOSS_COOLDOWN_MINUTES:
+            remaining = LOSS_COOLDOWN_MINUTES - elapsed_minutes
+            if longest is None or remaining > longest:
+                longest = remaining
+
+    return longest
 
 
 # ==========================================================================
@@ -235,8 +322,25 @@ async def open_position(decision, call):
                 reason="above hard cut at fill time",
             )
             return
-        entry_mc = live_mc
+
         gap_pct = (live_mc / call_mc - 1) * 100
+
+        # GUARD 1: the price has collapsed since the call was composed.
+        if gap_pct < -MAX_ENTRY_GAP_PCT:
+            log.info(
+                "REJECT %-9s live $%s vs call $%s (gap %+.1f%%)  | "
+                "below the -%d%% entry gap limit",
+                decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}",
+                gap_pct, MAX_ENTRY_GAP_PCT,
+            )
+            data_logger.log_call(
+                "rejected_fill", call, decision, live_mc=live_mc,
+                reason=(f"live price {gap_pct:+.1f}% vs call, beyond the "
+                        f"-{MAX_ENTRY_GAP_PCT}% entry gap limit"),
+            )
+            return
+
+        entry_mc = live_mc
         log.info(
             "FILL  %-10s live $%s vs call $%s  (gap %+.1f%%)",
             decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}", gap_pct,
@@ -247,6 +351,24 @@ async def open_position(decision, call):
             "FILL  %-10s no live price - falling back to call figure $%s",
             decision["ticker"], f"{call_mc:,.0f}",
         )
+
+    # GUARD 2: the entry price is already at or below the level at which the
+    # exit logic would immediately sell. Buying here means paying a swap fee
+    # to open a position that closes on the next monitor cycle. Applied to
+    # whichever figure became entry_mc above, so the call-figure fallback is
+    # covered too.
+    if entry_mc <= exit_logic.ABSOLUTE_FLOOR_MC:
+        log.info(
+            "REJECT %-9s $%s  | at or below the $%s absolute floor at entry",
+            decision["ticker"], f"{entry_mc:,.0f}",
+            f"{exit_logic.ABSOLUTE_FLOOR_MC:,.0f}",
+        )
+        data_logger.log_call(
+            "rejected_fill", call, decision, live_mc=live_mc,
+            reason=(f"entry price ${entry_mc:,.0f} is at or below the "
+                    f"${exit_logic.ABSOLUTE_FLOOR_MC:,.0f} absolute floor"),
+        )
+        return
 
     tokens = tokens_for(first["sol"], entry_mc, entry_mc)
 
@@ -484,6 +606,12 @@ async def _monitor_once(session):
             )
 
             if action["position_closed"]:
+                # Recorded so the loss cooldown can time itself, and so later
+                # analysis can group closes by how they ended without having
+                # to replay the fill history.
+                position["closed_at"] = datetime.now(timezone.utc).isoformat()
+                position["last_exit_type"] = action["exit_type"]
+
                 pnl = position["realised_sol"] - position["sol_invested"]
                 log.info(
                     "CLOSE %-10s invested %.3f SOL, returned %.3f SOL, P&L %+.4f SOL (%+.1f%%)",
@@ -553,6 +681,44 @@ async def on_message(event):
         )
         return
 
+    # Time-of-day gate. Checked before the PCR is scored, because there is no
+    # point valuing a call that cannot be acted on.
+    #
+    # This gates ENTRIES ONLY. The monitor loop keeps running whatever the
+    # clock says, so open positions are still managed for stop-loss, trailing
+    # stop and floor exits outside the window. Stopping the process instead
+    # is what produced the 81-94% trailing-stop overshoots on Ratatouille,
+    # BEAR and RODRI.
+    window_open, window_reason = trading_window.window_status()
+    if not window_open:
+        log.info("SKIP  %-10s outside trading window | %s",
+                 parsed["ticker"], window_reason)
+        data_logger.log_call(
+            "rejected_time_window", parsed,
+            {"action": "reject_time_window"},
+            reason=window_reason,
+        )
+        return
+
+    # Loss cooldown, keyed on ticker rather than contract. A relaunched token
+    # carries a new contract address, so the duplicate check above cannot see
+    # it - which is how ALING opened and floor-closed three times in eight
+    # minutes on 10 Aug for a combined -0.665 SOL.
+    cooldown_left = ticker_cooldown_remaining(parsed["ticker"])
+    if cooldown_left is not None:
+        log.info(
+            "SKIP  %-10s loss cooldown, %.0f min remaining of %d",
+            parsed["ticker"], cooldown_left, LOSS_COOLDOWN_MINUTES,
+        )
+        data_logger.log_call(
+            "rejected_cooldown", parsed,
+            {"action": "reject_cooldown"},
+            reason=(f"ticker closed at a loss within the last "
+                    f"{LOSS_COOLDOWN_MINUTES} minutes "
+                    f"({cooldown_left:.0f} min remaining)"),
+        )
+        return
+
     decision = entry_logic.decide_entry(parsed)
 
     if decision["action"] == "reject":
@@ -585,11 +751,41 @@ async def main():
             getattr(entry_logic, "MIN_BUY_SOL", "missing"),
         )
 
+    # Same idea for the strategy constants set on 10 Aug 2026. Commit 666267d
+    # claimed all three files but only entry_logic.py reached disk, so the bot
+    # ran a full session on the old trailing stop with no entry guards and
+    # nothing in the log said so. These checks make that state loud.
+    _expected = [
+        (entry_logic, "DCA_WEIGHTS_THREE", (0.45, 0.30, 0.25)),
+        (exit_logic, "TRAILING_STOP_DRAWDOWN", 0.60),
+    ]
+    for module, name, expected in _expected:
+        actual = getattr(module, name, "missing")
+        if actual != expected:
+            log.warning(
+                "%s.%s is %s, expected %s - that file is an OUTDATED version "
+                "and this session will not run the intended strategy.",
+                module.__name__, name, actual, expected,
+            )
+
     log.info("=" * 66)
     log.info("DRY RUN - no wallet loaded, no trades executed")
     log.info("channel: %s | polling every %ss", CHANNEL, POLL_INTERVAL_SECONDS)
     open_count = sum(1 for p in POSITIONS.values() if not p["closed"])
     log.info("restored %d position(s), %d still open", len(POSITIONS), open_count)
+
+    # Print the guards at startup so the log itself records which version of
+    # the rules produced a session's trades. The 10 Aug optimisation was
+    # committed but never reached runner.py, and nothing in the log would
+    # have revealed that.
+    log.info("-" * 66)
+    log.info("entry guards: max gap -%d%% | floor $%s | loss cooldown %d min",
+             MAX_ENTRY_GAP_PCT, f"{exit_logic.ABSOLUTE_FLOOR_MC:,.0f}",
+             LOSS_COOLDOWN_MINUTES)
+    is_open, reason = trading_window.window_status()
+    log.info("trading window: %s - %s", "OPEN" if is_open else "SHUT", reason)
+    if not is_open:
+        log.info("  entries are gated off; exits on open positions still run")
     log.info("=" * 66)
 
     async with client:

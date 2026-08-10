@@ -84,7 +84,7 @@ STOP_LOSS_DRAWDOWN = 0.55
 # Applies only after initials are taken, measured against the highest market
 # cap seen since entry. Wider than the stop-loss because the original stake
 # has already been recovered.
-TRAILING_STOP_DRAWDOWN = 0.70
+TRAILING_STOP_DRAWDOWN = 0.60
 
 # --- Spike confirmation ----------------------------------------------------
 # A market cap can gap through several levels in a second. Selling on the
