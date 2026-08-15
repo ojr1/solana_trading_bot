@@ -1,16 +1,21 @@
 """
 market_data.py - fetches live market cap data for tokens.
 
-Uses Jupiter's public lite-api endpoint, which requires no API key and is
-intended for exactly this kind of low-volume use. See spec section 7: Jupiter
-is the primary source because the bot already integrates with it for
-execution, with DexScreener available as a fallback if rate limits or
-reliability become a problem in practice.
+ENDPOINT (updated 10 Aug 2026): the keyed api.jup.ag endpoint is primary,
+matching trade_execution.py. Jupiter is deprecating the no-key lite-api
+domain, and this module is the bot's most safety-critical data feed - every
+stop-loss, trailing stop and floor exit depends on the prices it returns.
+If lite-api died while the bot held positions, the monitor would silently
+receive nothing and every open position would go unmanaged, which is the
+exact downtime-overshoot failure seen on Ratatouille, BEAR and RODRI.
 
-Requests are BATCHED. The free tier shares a single rate-limit bucket over a
-60-second window, so polling ten positions individually every five seconds
-would risk being throttled. Asking for every open position in one request
-keeps usage flat regardless of how many positions are open.
+If JUPITER_API_KEY is missing from .env the module still works, falling back
+to lite-api with a loud warning at import time - degraded, not broken.
+
+Requests are BATCHED. Both tiers share a rate-limit bucket over a 60-second
+window, so polling ten positions individually every five seconds would risk
+being throttled. Asking for every open position in one request keeps usage
+flat regardless of how many positions are open.
 
 To verify the response format against the live API:
 
@@ -18,13 +23,39 @@ To verify the response format against the live API:
 """
 
 import asyncio
+import logging
+import os
 import sys
 
 import aiohttp
+from dotenv import load_dotenv
 
-# Public, no-key endpoint. The paid equivalent is api.jup.ag, which would need
-# a key in .env - not required at this volume.
-JUPITER_SEARCH_URL = "https://lite-api.jup.ag/tokens/v2/search"
+load_dotenv()
+
+log = logging.getLogger("market_data")
+
+# Primary keyed endpoint - same host trade_execution.py uses for swaps, so
+# execution and monitoring share one dependency that is actively maintained.
+JUPITER_API_URL = "https://api.jup.ag/tokens/v2/search"
+
+# Deprecated no-key endpoint, kept only as a fallback so a missing key
+# degrades the bot rather than stopping it.
+JUPITER_LITE_URL = "https://lite-api.jup.ag/tokens/v2/search"
+
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
+
+if JUPITER_API_KEY:
+    SEARCH_URL = JUPITER_API_URL
+    _HEADERS = {"x-api-key": JUPITER_API_KEY}
+else:
+    SEARCH_URL = JUPITER_LITE_URL
+    _HEADERS = {}
+    log.warning(
+        "JUPITER_API_KEY missing from .env - falling back to the deprecated "
+        "lite-api.jup.ag endpoint. Position monitoring will stop working "
+        "when Jupiter retires that domain. Add the key used by "
+        "trade_execution.py to .env."
+    )
 
 # Jupiter accepts multiple comma-separated mints per query.
 MAX_MINTS_PER_REQUEST = 90
@@ -64,7 +95,8 @@ async def _fetch_batch(session, mints):
     params = {"query": ",".join(mints)}
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
 
-    async with session.get(JUPITER_SEARCH_URL, params=params, timeout=timeout) as response:
+    async with session.get(SEARCH_URL, params=params, headers=_HEADERS,
+                           timeout=timeout) as response:
         response.raise_for_status()
         payload = await response.json()
 
@@ -110,9 +142,13 @@ async def _verify(mint):
     """Prints the raw API response so the field names above can be checked."""
     import json
 
+    print(f"Endpoint in use: {SEARCH_URL}")
+    print(f"API key loaded : {'yes' if JUPITER_API_KEY else 'NO - using fallback'}\n")
+
     async with aiohttp.ClientSession() as session:
         params = {"query": mint}
-        async with session.get(JUPITER_SEARCH_URL, params=params) as response:
+        async with session.get(SEARCH_URL, params=params,
+                               headers=_HEADERS) as response:
             print(f"HTTP {response.status}")
             payload = await response.json()
 

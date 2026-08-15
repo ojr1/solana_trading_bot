@@ -97,6 +97,8 @@ def log_call(event, parsed=None, decision=None, live_mc=None, reason=None,
         rejected_fill   accepted, then declined once the live price was seen
         parse_fail      recognised as a call but fields were missing
         duplicate       contract already held or previously traded
+        rejected_time_window   call arrived outside the trading window
+        rejected_cooldown      ticker closed at a loss within the cooldown
     """
     parsed = parsed or {}
     decision = decision or {}
