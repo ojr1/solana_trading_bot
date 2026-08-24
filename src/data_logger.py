@@ -99,6 +99,10 @@ def log_call(event, parsed=None, decision=None, live_mc=None, reason=None,
         duplicate       contract already held or previously traded
         rejected_time_window   call arrived outside the trading window
         rejected_cooldown      ticker closed at a loss within the cooldown
+        rejected_no_price      no live price available at fill time
+        rejected_stale_call    call message older than the staleness limit
+        rejected_ticker_open   ticker already has an OPEN position (different
+                                contract)
     """
     parsed = parsed or {}
     decision = decision or {}

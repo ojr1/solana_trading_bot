@@ -28,6 +28,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import aiohttp
@@ -62,6 +63,18 @@ POSITIONS_FILE = LOGS_DIR / "positions.json"
 # "nothing is happening" from "pricing has silently stopped working".
 STATUS_INTERVAL_SECONDS = 300
 
+# If the wall-clock gap between monitor cycles exceeds this, the process was
+# suspended (e.g. the machine slept) rather than merely running slow. Uses
+# time.time(), not time.monotonic() - monotonic does not advance during a
+# Windows sleep, which is exactly why the 16 Aug stall left nothing in the
+# log until the next reconnect. Log-only: never alters trading behaviour.
+SUSPENSION_THRESHOLD_SECONDS = 30
+
+# If there are open positions and no market data fetch has SUCCEEDED for
+# longer than this, something is wrong even though the loop is still ticking
+# - without this a wedged loop looks identical to a dead network. Log-only.
+STALE_FETCH_WARNING_SECONDS = 180
+
 # ---------------------------------------------------------------------------
 # ENTRY GUARDS (added 10 Aug 2026 after the first full overnight run)
 #
@@ -90,6 +103,14 @@ MAX_ENTRY_GAP_PCT = 35
 # contract-keyed duplicate check.
 LOSS_COOLDOWN_MINUTES = 60
 
+# Reject a call whose Telegram message is older than this by the time it is
+# processed. Telethon redelivers a whole backlog of queued messages in the
+# same second after a reconnect, and the bot has no other way to tell a
+# fresh call from an hours-old one - this is what let bih, PUMPTOWN and
+# HALLU fill blind on 16 Aug 2026. Five minutes is generous: normal
+# call-to-fill time in the log is seconds.
+MAX_CALL_AGE_SECONDS = 300
+
 # Positions that have closed are kept in the file for later analysis rather
 # than deleted, but are skipped by the monitor.
 load_dotenv()
@@ -105,16 +126,30 @@ CHANNEL = os.getenv("TELEGRAM_CHANNEL")
 
 
 def setup_logging():
-    """Logs to the console and to a dated file, so nothing is lost overnight."""
+    """
+    Logs to the console and to a rotating file, so nothing is lost on a
+    multi-day run.
+
+    Rotates at local midnight and keeps 14 days of history. Previously the
+    filename was computed once at import from the START date, so a run
+    spanning midnight (like 15-16 Aug) kept writing into the file named for
+    the day it started, and an unattended VPS run would grow one unbounded
+    file. NOTE: this changes the filename convention - today's file is now
+    dryrun.log, and rotated files are dryrun.log.YYYY-MM-DD, not
+    dryrun_YYYY-MM-DD.log.
+    """
     LOGS_DIR.mkdir(exist_ok=True)
-    logfile = LOGS_DIR / f"dryrun_{datetime.now(timezone.utc):%Y-%m-%d}.log"
+    logfile = LOGS_DIR / "dryrun.log"
+
+    file_handler = TimedRotatingFileHandler(
+        logfile, when="midnight", backupCount=14, encoding="utf-8",
+    )
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%H:%M:%S",
-        handlers=[logging.FileHandler(logfile, encoding="utf-8"),
-                  logging.StreamHandler()],
+        handlers=[file_handler, logging.StreamHandler()],
     )
     return logging.getLogger("runner")
 
@@ -173,6 +208,11 @@ def save_positions(positions):
 POSITIONS = load_positions()
 
 
+def _normalise_ticker(ticker):
+    """Whitespace-stripped, lowercased ticker, for case-insensitive comparison."""
+    return (ticker or "").strip().lower()
+
+
 def ticker_cooldown_remaining(ticker):
     """
     Minutes left on the loss cooldown for this ticker, or None if clear.
@@ -194,14 +234,14 @@ def ticker_cooldown_remaining(ticker):
     if not ticker:
         return None
 
-    target = ticker.strip().lower()
+    target = _normalise_ticker(ticker)
     now = datetime.now(timezone.utc)
     longest = None
 
     for position in POSITIONS.values():
         if not position.get("closed"):
             continue
-        if (position.get("ticker") or "").strip().lower() != target:
+        if _normalise_ticker(position.get("ticker")) != target:
             continue
 
         # Net loss check. A position with no realised figure is skipped
@@ -229,6 +269,59 @@ def ticker_cooldown_remaining(ticker):
                 longest = remaining
 
     return longest
+
+
+def open_position_for_ticker(ticker):
+    """
+    Contract address of any OPEN position sharing this ticker, or None.
+
+    The duplicate check above is keyed on contract address, so a second
+    contract launched under the same ticker sails straight through it - that
+    is how PANDA held two simultaneous positions on 16 Aug 2026, seven
+    minutes apart on different contracts. Reuses the same normalisation as
+    ticker_cooldown_remaining() so the two checks can never disagree about
+    what counts as "the same ticker".
+    """
+    if not ticker:
+        return None
+
+    target = _normalise_ticker(ticker)
+    for contract, position in POSITIONS.items():
+        if position.get("closed"):
+            continue
+        if _normalise_ticker(position.get("ticker")) == target:
+            return contract
+
+    return None
+
+
+# ==========================================================================
+# CALL FRESHNESS
+#
+# A reconnect makes Telethon redeliver every message it missed while
+# disconnected, all in the same second. Nothing about that redelivery marks
+# a message as old, so without this check the bot scores and fills a call
+# that may be hours stale as if it had just arrived.
+# ==========================================================================
+
+
+def call_age_seconds(message_date, now=None):
+    """
+    Seconds between a Telegram message's timestamp and now.
+
+    Both must be aware datetimes (carrying timezone info) - message_date is
+    event.message.date from Telethon, which always is. Kept standalone and
+    synchronous, with no Telethon dependency, so it can be unit-tested with
+    plain datetimes instead of a fake event object.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    return (now - message_date).total_seconds()
+
+
+def is_call_stale(message_date, now=None):
+    """True if a call's message is older than MAX_CALL_AGE_SECONDS."""
+    return call_age_seconds(message_date, now) > MAX_CALL_AGE_SECONDS
 
 
 # ==========================================================================
@@ -296,7 +389,14 @@ async def open_position(decision, call):
         slip in under its stale figure.
 
     If no live price is available (very new tokens are sometimes not yet
-    indexed), the call figure is used as a fallback and flagged in the log.
+    indexed, or the API request failed), the fill is REJECTED rather than
+    using the stale call figure. The entire entry model above is "fill at
+    the live price"; without one, the gap guard is comparing the call figure
+    to itself and can never fire. That gap is exactly how bih, PUMPTOWN and
+    HALLU filled blind on 16 Aug 2026 for a combined -0.517 SOL - the bot
+    woke from a network outage, got no live price, and bought three
+    hours-dead coins at their stale call figures. Missing a trade costs
+    nothing; filling blind does not.
     """
     contract = decision["contract_address"]
     tranches = decision["tranches"]
@@ -311,52 +411,54 @@ async def open_position(decision, call):
     except aiohttp.ClientError as exc:
         log.warning("Live price fetch failed for %s: %s", decision["ticker"], exc)
 
-    if live_mc is not None:
-        if live_mc >= entry_logic.MC_HARD_CUT:
-            log.info(
-                "REJECT %-9s live $%s (call said $%s)  | above hard cut at fill time",
-                decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}",
-            )
-            data_logger.log_call(
-                "rejected_fill", call, decision, live_mc=live_mc,
-                reason="above hard cut at fill time",
-            )
-            return
-
-        gap_pct = (live_mc / call_mc - 1) * 100
-
-        # GUARD 1: the price has collapsed since the call was composed.
-        if gap_pct < -MAX_ENTRY_GAP_PCT:
-            log.info(
-                "REJECT %-9s live $%s vs call $%s (gap %+.1f%%)  | "
-                "below the -%d%% entry gap limit",
-                decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}",
-                gap_pct, MAX_ENTRY_GAP_PCT,
-            )
-            data_logger.log_call(
-                "rejected_fill", call, decision, live_mc=live_mc,
-                reason=(f"live price {gap_pct:+.1f}% vs call, beyond the "
-                        f"-{MAX_ENTRY_GAP_PCT}% entry gap limit"),
-            )
-            return
-
-        entry_mc = live_mc
+    if live_mc is None:
         log.info(
-            "FILL  %-10s live $%s vs call $%s  (gap %+.1f%%)",
-            decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}", gap_pct,
-        )
-    else:
-        entry_mc = call_mc
-        log.warning(
-            "FILL  %-10s no live price - falling back to call figure $%s",
+            "REJECT %-9s no live price available  | call figure was $%s",
             decision["ticker"], f"{call_mc:,.0f}",
         )
+        data_logger.log_call(
+            "rejected_no_price", call, decision, live_mc=None,
+            reason="no live price available at fill time - refusing to fill blind",
+        )
+        return
+
+    if live_mc >= entry_logic.MC_HARD_CUT:
+        log.info(
+            "REJECT %-9s live $%s (call said $%s)  | above hard cut at fill time",
+            decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}",
+        )
+        data_logger.log_call(
+            "rejected_fill", call, decision, live_mc=live_mc,
+            reason="above hard cut at fill time",
+        )
+        return
+
+    gap_pct = (live_mc / call_mc - 1) * 100
+
+    # GUARD 1: the price has collapsed since the call was composed.
+    if gap_pct < -MAX_ENTRY_GAP_PCT:
+        log.info(
+            "REJECT %-9s live $%s vs call $%s (gap %+.1f%%)  | "
+            "below the -%d%% entry gap limit",
+            decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}",
+            gap_pct, MAX_ENTRY_GAP_PCT,
+        )
+        data_logger.log_call(
+            "rejected_fill", call, decision, live_mc=live_mc,
+            reason=(f"live price {gap_pct:+.1f}% vs call, beyond the "
+                    f"-{MAX_ENTRY_GAP_PCT}% entry gap limit"),
+        )
+        return
+
+    entry_mc = live_mc
+    log.info(
+        "FILL  %-10s live $%s vs call $%s  (gap %+.1f%%)",
+        decision["ticker"], f"{live_mc:,.0f}", f"{call_mc:,.0f}", gap_pct,
+    )
 
     # GUARD 2: the entry price is already at or below the level at which the
     # exit logic would immediately sell. Buying here means paying a swap fee
-    # to open a position that closes on the next monitor cycle. Applied to
-    # whichever figure became entry_mc above, so the call-figure fallback is
-    # covered too.
+    # to open a position that closes on the next monitor cycle.
     if entry_mc <= exit_logic.ABSOLUTE_FLOOR_MC:
         log.info(
             "REJECT %-9s $%s  | at or below the $%s absolute floor at entry",
@@ -517,13 +619,78 @@ def check_dca_fills(position, current_mc):
 
 # ==========================================================================
 # MONITOR LOOP
+#
+# Two watchdogs below are log-only diagnostics added after the 16 Aug
+# overnight run, where a 2.5-hour Windows sleep went completely unnoticed in
+# the log. Both are pure functions of a timestamp so they can be
+# unit-tested without running the asyncio loop, and neither ever raises,
+# exits, or changes what gets traded.
 # ==========================================================================
+
+
+def suspended_gap_seconds(previous_wall_clock, now=None,
+                           threshold=SUSPENSION_THRESHOLD_SECONDS):
+    """
+    Gap in seconds since the last monitor cycle, if it looks like a
+    suspend/sleep (exceeds threshold) rather than normal jitter; else None.
+    """
+    if previous_wall_clock is None:
+        return None
+    if now is None:
+        now = time.time()
+    gap = now - previous_wall_clock
+    return gap if gap > threshold else None
+
+
+def stale_fetch_gap_seconds(last_success_at, now=None, has_open_positions=True,
+                             threshold=STALE_FETCH_WARNING_SECONDS):
+    """
+    Gap in seconds since the last successful market data fetch, if there are
+    open positions and it exceeds threshold; else None.
+    """
+    if not has_open_positions or last_success_at is None:
+        return None
+    if now is None:
+        now = time.time()
+    gap = now - last_success_at
+    return gap if gap > threshold else None
+
+
+# Wall-clock time.time() of the previous monitor cycle, and of the last
+# market data fetch that succeeded. Seeded at import so a fresh start does
+# not immediately look suspended or stale.
+_last_cycle_wall_clock = None
+_last_successful_fetch_at = time.time()
 
 
 async def monitor_positions():
     """Re-prices every open position on a timer and applies the exit rules."""
+    global _last_cycle_wall_clock
+
     async with aiohttp.ClientSession() as session:
         while True:
+            now = time.time()
+
+            gap = suspended_gap_seconds(_last_cycle_wall_clock, now)
+            if gap is not None:
+                log.warning(
+                    "PROCESS SUSPENDED for %.0fs (%.1fh) - machine likely "
+                    "slept; open positions were unmanaged",
+                    gap, gap / 3600,
+                )
+            _last_cycle_wall_clock = now
+
+            has_open_positions = any(not p["closed"] for p in POSITIONS.values())
+            stale_gap = stale_fetch_gap_seconds(
+                _last_successful_fetch_at, now, has_open_positions,
+            )
+            if stale_gap is not None:
+                log.warning(
+                    "NO SUCCESSFUL MARKET DATA FETCH for %.0fs (%.1fmin) with "
+                    "open positions - wedged loop or dead network",
+                    stale_gap, stale_gap / 60,
+                )
+
             try:
                 await _monitor_once(session)
             except aiohttp.ClientError as exc:
@@ -542,13 +709,14 @@ _last_status_at = 0.0
 
 
 async def _monitor_once(session):
-    global _last_status_at
+    global _last_status_at, _last_successful_fetch_at
 
     open_positions = {k: v for k, v in POSITIONS.items() if not v["closed"]}
     if not open_positions:
         return
 
     market_caps = await market_data.fetch_market_caps(session, list(open_positions))
+    _last_successful_fetch_at = time.time()
     now = time.time()
     changed = False
 
@@ -669,6 +837,23 @@ async def on_message(event):
         )
         return
 
+    # Staleness gate. A reconnect makes Telethon redeliver every message it
+    # missed while disconnected, all in the same second, with nothing marking
+    # them as old. This is what let a backlog flush fill three hours-dead
+    # coins on 16 Aug 2026 as if they had just arrived.
+    age_seconds = call_age_seconds(event.message.date)
+    if is_call_stale(event.message.date):
+        log.info(
+            "REJECT %-9s call is %.0fs old  | older than the %ds staleness limit",
+            parsed["ticker"], age_seconds, MAX_CALL_AGE_SECONDS,
+        )
+        data_logger.log_call(
+            "rejected_stale_call", parsed,
+            reason=(f"call message is {age_seconds:.0f}s old, older than the "
+                    f"{MAX_CALL_AGE_SECONDS}s staleness limit"),
+        )
+        return
+
     contract = parsed["contract_address"]
 
     # Duplicate protection. A channel repost or a reconnect that redelivers a
@@ -678,6 +863,23 @@ async def on_message(event):
         data_logger.log_call(
             "duplicate", parsed,
             reason="contract already held or previously traded",
+        )
+        return
+
+    # Same-ticker-open guard. Duplicate protection above is keyed on contract
+    # address, so a relaunch under the same ticker (a different contract) is
+    # invisible to it - which is how PANDA held two simultaneous positions on
+    # 16 Aug 2026, seven minutes apart on different contracts, combined
+    # -0.357 SOL.
+    open_contract = open_position_for_ticker(parsed["ticker"])
+    if open_contract is not None:
+        log.info(
+            "SKIP  %-10s already open under contract %s",
+            parsed["ticker"], open_contract,
+        )
+        data_logger.log_call(
+            "rejected_ticker_open", parsed,
+            reason=f"ticker already open under contract {open_contract}",
         )
         return
 
