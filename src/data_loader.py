@@ -8,6 +8,17 @@ import from here so they can never drift apart.
 
 Excel analogy: this file is the hidden "helper table" tab that every pivot
 in the workbook points at. Fix a calculation here, every report updates.
+
+UPDATED 15 Aug 2026: the Jupiter detail fields (top_holders_pct,
+organic_score, dev_migrations, dev_mints, liquidity, launchpad,
+live_holder_count) are now surfaced as columns.
+
+These will be EMPTY for every trade taken before 15 Aug 2026, because they
+were not being recorded then. That is not a bug and must not be patched over
+with a default value - a zero would be read by the analysis as a real
+measurement of zero. They stay blank, the analysis counts how many rows
+actually have a value, and it refuses to correlate a column that does not yet
+have enough of them. See MIN_SAMPLE_FOR_INPUT in pcr_analysis.py.
 """
 
 import json
@@ -34,6 +45,21 @@ LOCAL_TZ = ZoneInfo("Europe/London")
 # Floating-point noise absorber. A trade landing within +/- 0.001 SOL of flat
 # is called breakeven rather than a 0.0000001 SOL "win".
 BREAKEVEN_TOLERANCE_SOL = 0.001
+
+# The Jupiter detail columns, imported from market_data so there is exactly
+# one definition of the list. If market_data cannot be imported (it needs
+# aiohttp, which an analysis-only environment may not have), fall back to a
+# static copy rather than failing - analysis must never depend on the bot's
+# network libraries being installed.
+try:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from market_data import DETAIL_COLUMNS
+except ImportError:
+    DETAIL_COLUMNS = (
+        "top_holders_pct", "organic_score", "dev_migrations",
+        "dev_mints", "liquidity", "launchpad", "live_holder_count",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +93,24 @@ def _classify_outcome(net_sol):
     if net_sol < -BREAKEVEN_TOLERANCE_SOL:
         return "loss"
     return "breakeven"
+
+
+def coverage(trades, columns=DETAIL_COLUMNS):
+    """How many rows actually carry a value for each of the given columns.
+
+    Returns {column: count_of_non_empty}. Used by the analysis scripts to
+    decide whether a column has accumulated enough data to be worth testing,
+    and by the self-test below to show progress as nights are added.
+
+    Excel analogy: COUNTA() down each column, ignoring blanks.
+    """
+    result = {}
+    for column in columns:
+        if column not in trades.columns:
+            result[column] = 0
+        else:
+            result[column] = int(trades[column].notna().sum())
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +175,7 @@ def load_closed_trades(positions_path=POSITIONS_PATH):
         # rebuilt here so it can be tested against outcome directly.
         holders_per_minute = _safe_divide(holders, age_minutes)
 
-        rows.append({
+        row = {
             # --- identity ---
             "ticker": position.get("ticker"),
             "contract_address": position.get("contract_address"),
@@ -160,7 +204,16 @@ def load_closed_trades(positions_path=POSITIONS_PATH):
             # --- context ---
             "initials_taken": position.get("initials_taken"),
             "fill_count": len(position.get("fills") or []),
-        })
+        }
+
+        # Jupiter detail fields, added 15 Aug 2026. .get() returns None for
+        # every trade taken before that date, which is exactly right - the
+        # value was never measured, so it must stay blank rather than being
+        # defaulted to a number the analysis would read as real.
+        for column in DETAIL_COLUMNS:
+            row[column] = position.get(column)
+
+        rows.append(row)
 
     frame = pd.DataFrame(rows)
 
@@ -188,6 +241,20 @@ if __name__ == "__main__":
         print(f"Total invested: {trades['sol_invested'].sum():.3f} SOL")
         print(f"Net P&L: {trades['net_sol'].sum():+.3f} SOL")
 
+        # Jupiter detail field progress. These start at zero and climb as
+        # nights accumulate; this is the number to watch before expecting the
+        # exploratory section of pcr_analysis.py to say anything.
+        print("\nJupiter detail fields (recorded from 15 Aug 2026 onward):")
+        counts = coverage(trades)
+        for column, count in counts.items():
+            share = count / len(trades) * 100
+            print(f"  {column:<20} {count:>4} of {len(trades)} rows "
+                  f"({share:>5.1f}%)")
+
+        if max(counts.values()) == 0:
+            print("\n  None populated yet - expected until the bot next runs")
+            print("  with the updated market_data.py and runner.py.")
+
         # Flag any column with gaps - matters because a column that is mostly
         # empty cannot be correlated against anything in the PCR script.
         missing = trades.isna().sum()
@@ -195,7 +262,8 @@ if __name__ == "__main__":
         if len(gaps) > 0:
             print("\nColumns with missing values:")
             for column, count in gaps.items():
-                print(f"  {column}: {count} of {len(trades)} rows empty")
+                note = "  (expected - new field)" if column in DETAIL_COLUMNS else ""
+                print(f"  {column}: {count} of {len(trades)} rows empty{note}")
         else:
             print("\nNo missing values in any column.")
 

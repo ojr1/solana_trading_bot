@@ -22,6 +22,18 @@ is reported to the console then swallowed. A lost log line is an inconvenience;
 a crashed process holding open positions is not.
 
     python src/data_logger.py        runs the self-test
+
+SCHEMA HISTORY
+--------------
+  v1  (03 Aug 2026)  original three files
+  v2  (15 Aug 2026)  call records gained the Jupiter detail fields:
+                     top_holders_pct, organic_score, dev_migrations,
+                     dev_mints, liquidity, launchpad, live_holder_count.
+
+Why the version number matters: records written before 15 Aug have no such
+keys at all, and records written after have them but often as null. Analysis
+that pools the two without checking schema_version will read "field absent"
+and "field present but empty" as the same thing, which they are not.
 """
 
 import json
@@ -31,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Bump this when a schema changes, so analysis can tell record shapes apart.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DATA_DIR = Path("data")
 CALLS_FILE = DATA_DIR / "calls.jsonl"
@@ -44,6 +56,20 @@ log = logging.getLogger("data_logger")
 # process carries it, so a session can be isolated during analysis - useful
 # when downtime means a gap in coverage rather than a gap in the market.
 RUN_ID = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{os.getpid()}"
+
+# The Jupiter detail fields carried on a call record. Imported from
+# market_data so there is one definition rather than two that drift apart.
+# Falls back to a literal list if market_data cannot be imported, because
+# logging must never be the reason the bot fails to start.
+try:
+    from market_data import DETAIL_COLUMNS
+except ImportError:  # pragma: no cover - defensive only
+    DETAIL_COLUMNS = (
+        "top_holders_pct", "organic_score", "dev_migrations",
+        "dev_mints", "liquidity", "launchpad", "live_holder_count",
+    )
+    log.warning("data_logger could not import market_data; using a static "
+                "copy of the detail field list. Check src/market_data.py.")
 
 
 def _now():
@@ -87,7 +113,7 @@ def _write(path, record):
 
 
 def log_call(event, parsed=None, decision=None, live_mc=None, reason=None,
-             raw_text=None):
+             raw_text=None, token_details=None):
     """
     Records a call and the decision taken on it.
 
@@ -103,9 +129,22 @@ def log_call(event, parsed=None, decision=None, live_mc=None, reason=None,
         rejected_stale_call    call message older than the staleness limit
         rejected_ticker_open   ticker already has an OPEN position (different
                                 contract)
+
+    token_details (added 15 Aug 2026) is the dictionary returned by
+    market_data.fetch_token_details() for this contract. It is only available
+    once the live price has been fetched, which happens at fill time - so
+    calls rejected BEFORE that point (time window, cooldown, PCR reject,
+    duplicate) carry these fields as null. That is expected: fetching Jupiter
+    data for every call the bot will never touch would triple API usage for
+    a control group that has no outcome to correlate against anyway.
+
+    Every detail key is written on every call record whether or not a value
+    was found, so the column exists in the data from day one and pandas reads
+    it back as a proper column rather than a ragged table.
     """
     parsed = parsed or {}
     decision = decision or {}
+    token_details = token_details or {}
 
     record = {
         "event": event,
@@ -126,6 +165,10 @@ def log_call(event, parsed=None, decision=None, live_mc=None, reason=None,
         "tranche_count": len(decision.get("tranches", [])) or None,
         "reason": reason or decision.get("reason"),
     }
+
+    # Jupiter detail fields. Written unconditionally so the schema is stable.
+    for column in DETAIL_COLUMNS:
+        record[column] = token_details.get(column)
 
     # Only kept for parse failures, and truncated - the point is to see the
     # message format that broke, not to archive the channel.
@@ -226,6 +269,16 @@ def _run_self_test():
         "total_lot_sol": 0.38,
         "tranches": [{"stage": 1}, {"stage": 2}, {"stage": 3}],
     }
+    fake_details = {
+        "top_holders_pct": 21.7,
+        "organic_score": 63.2,
+        "dev_migrations": 3.0,
+        "dev_mints": 11.0,
+        "liquidity": 18_400.5,
+        "launchpad": "pump.fun",
+        "live_holder_count": 412.0,
+        "market_cap": 24_000.0,
+    }
     fake_position = {
         "ticker": "TESTCOIN",
         "contract_address": fake_parsed["contract_address"],
@@ -242,9 +295,16 @@ def _run_self_test():
 
     print("Writing test records to data/ ...\n")
 
-    log_call("bought", fake_parsed, fake_decision, live_mc=24_000)
+    # A buy, carrying the full Jupiter detail set.
+    log_call("bought", fake_parsed, fake_decision, live_mc=24_000,
+             token_details=fake_details)
+    # A reject that happened before any Jupiter fetch - details are null.
     log_call("rejected", fake_parsed, {"action": "reject",
                                        "reason": "market cap above hard cut"})
+    # A reject at fill time - details ARE available here.
+    log_call("rejected_fill", fake_parsed, fake_decision, live_mc=5_100,
+             reason="below the -35% entry gap limit",
+             token_details=fake_details)
     log_call("parse_fail", raw_text="Just did x3 - some message with no ticker")
 
     log_fill("buy", fake_position, 0.114, 24_000, stage=1)
@@ -254,9 +314,12 @@ def _run_self_test():
 
     log_snapshot(fake_position, 33_500, 0.159, 0.045)
 
+    failures = 0
+
     for path in (CALLS_FILE, FILLS_FILE, SNAPSHOTS_FILE):
         if not path.exists():
             print(f"  MISSING  {path}")
+            failures += 1
             continue
         with open(path, encoding="utf-8") as f:
             lines = f.readlines()
@@ -266,13 +329,38 @@ def _run_self_test():
                 json.loads(line)
             except json.JSONDecodeError:
                 print(f"  BAD LINE {i} in {path.name}")
+                failures += 1
                 break
         else:
             print(f"  OK  {path}  ({len(lines)} line(s), all valid JSON)")
 
+    # Schema check: every call record must carry every detail column, whether
+    # or not a value was found. A missing key is a schema bug, not a blank.
+    print("\nSchema check on the call records written just now:")
+    with open(CALLS_FILE, encoding="utf-8") as f:
+        recent = [json.loads(line) for line in f][-4:]
+
+    for record in recent:
+        missing = [c for c in DETAIL_COLUMNS if c not in record]
+        if missing:
+            print(f"  FAIL  {record['event']:<16} missing keys: {missing}")
+            failures += 1
+        else:
+            filled = sum(1 for c in DETAIL_COLUMNS
+                         if record.get(c) is not None)
+            print(f"  OK    {record['event']:<16} all "
+                  f"{len(DETAIL_COLUMNS)} detail keys present, "
+                  f"{filled} populated")
+
     print(f"\nrun_id for this session: {RUN_ID}")
-    print("Self-test complete. Inspect the files in data/ to see the shape.")
+    print(f"schema_version written:  {SCHEMA_VERSION}")
+
+    if failures == 0:
+        print("\nDATA_LOGGER SELF-TEST PASSED")
+    else:
+        print(f"\nDATA_LOGGER SELF-TEST FAILED - {failures} problem(s) above")
+    return failures
 
 
 if __name__ == "__main__":
-    _run_self_test()
+    raise SystemExit(1 if _run_self_test() else 0)

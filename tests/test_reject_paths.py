@@ -1,5 +1,5 @@
 """
-test_stage2_integration.py - integration tests for runner.py's entry guards.
+test_reject_paths.py - integration tests for runner.py's entry guards.
 
 Exercises open_position() and on_message() directly, using fakes for the
 Telethon event and mocks for the Jupiter price fetch and the trading-window
@@ -7,7 +7,21 @@ clock. No real network call, no Telegram credential, and no write to the
 real logs/positions.json or data/*.jsonl is needed or made - every test
 isolates POSITIONS and the data_logger output paths first.
 
-Run standalone:   python tests\test_stage2_integration.py
+RENAMED 25 Aug 2026 from tests/test_stage2_integration.py during the recovery
+merge, to resolve a filename collision with the Jupiter-fields tests (now
+tests/test_jupiter_fields.py) - the two files test different things and both
+were called test_stage2_integration.py in their own history.
+
+Also updated then: open_position() now fetches via
+market_data.fetch_token_details() rather than fetch_market_caps() (see the
+recovery merge in src/runner.py), so the mocks below patch that function and
+return the {mint: {"market_cap": ...}} shape it returns, not the older
+{mint: market_cap} shape fetch_market_caps returns. Before this fix these
+tests were silently making a real, blocked network call in the gap - a run
+of tests/run_all.py caught it because the affected checks failed outright
+rather than passing on stale assumptions.
+
+Run standalone:   python tests\test_reject_paths.py
 Run full suite:   python tests\run_all.py
 """
 
@@ -132,7 +146,7 @@ def check_no_live_price_rejects():
         return {}  # Jupiter returned nothing for this mint
 
     with isolated_state() as (positions, calls_path):
-        with mock.patch.object(runner.market_data, "fetch_market_caps", no_price):
+        with mock.patch.object(runner.market_data, "fetch_token_details", no_price):
             asyncio.run(runner.open_position(decision, call))
 
         assert contract not in positions, "a position was opened with no live price"
@@ -167,10 +181,10 @@ def check_fresh_call_accepted():
     event = FakeEvent(text, fresh_date)
 
     async def stable_price(session, mints):
-        return {contract: 20_000}  # matches the call figure - 0% gap
+        return {contract: {"market_cap": 20_000}}  # matches the call figure - 0% gap
 
     with isolated_state() as (positions, calls_path):
-        with mock.patch.object(runner.market_data, "fetch_market_caps", stable_price):
+        with mock.patch.object(runner.market_data, "fetch_token_details", stable_price):
             asyncio.run(runner.on_message(event))
 
         records = read_jsonl(calls_path)
@@ -218,9 +232,9 @@ def check_ticker_closed_at_profit_allowed():
         event = FakeEvent(text, datetime.now(timezone.utc))
 
         async def stable_price(session, mints):
-            return {contract_new: 20_000}
+            return {contract_new: {"market_cap": 20_000}}
 
-        with mock.patch.object(runner.market_data, "fetch_market_caps", stable_price):
+        with mock.patch.object(runner.market_data, "fetch_token_details", stable_price):
             asyncio.run(runner.on_message(event))
 
         records = read_jsonl(calls_path)
@@ -309,4 +323,4 @@ if __name__ == "__main__":
     if failures:
         print(f"{len(failures)} check(s) FAILED")
         sys.exit(1)
-    print("All checks in this module passed")
+    print("REJECT PATH TESTS PASSED")

@@ -403,11 +403,21 @@ async def open_position(decision, call):
     first = tranches[0]
     call_mc = call["market_cap"]
 
+    # ONE fetch, returning the live price AND the extra Jupiter fields added
+    # 15 Aug 2026. This is the only place they are collected: the 5-second
+    # monitor loop still calls fetch_market_caps and is untouched, so nothing
+    # about the exit path changes.
+    #
+    # None of these fields feeds a decision below. They are captured purely so
+    # they accumulate on disk and can be tested once enough nights exist - a
+    # field never recorded cannot be recovered retrospectively.
     live_mc = None
+    token_details = {}
     try:
         async with aiohttp.ClientSession() as session:
-            caps = await market_data.fetch_market_caps(session, [contract])
-        live_mc = caps.get(contract)
+            details = await market_data.fetch_token_details(session, [contract])
+        token_details = details.get(contract) or {}
+        live_mc = token_details.get("market_cap")
     except aiohttp.ClientError as exc:
         log.warning("Live price fetch failed for %s: %s", decision["ticker"], exc)
 
@@ -419,6 +429,7 @@ async def open_position(decision, call):
         data_logger.log_call(
             "rejected_no_price", call, decision, live_mc=None,
             reason="no live price available at fill time - refusing to fill blind",
+            token_details=token_details,
         )
         return
 
@@ -430,6 +441,7 @@ async def open_position(decision, call):
         data_logger.log_call(
             "rejected_fill", call, decision, live_mc=live_mc,
             reason="above hard cut at fill time",
+            token_details=token_details,
         )
         return
 
@@ -447,6 +459,7 @@ async def open_position(decision, call):
             "rejected_fill", call, decision, live_mc=live_mc,
             reason=(f"live price {gap_pct:+.1f}% vs call, beyond the "
                     f"-{MAX_ENTRY_GAP_PCT}% entry gap limit"),
+            token_details=token_details,
         )
         return
 
@@ -469,6 +482,7 @@ async def open_position(decision, call):
             "rejected_fill", call, decision, live_mc=live_mc,
             reason=(f"entry price ${entry_mc:,.0f} is at or below the "
                     f"${exit_logic.ABSOLUTE_FLOOR_MC:,.0f} absolute floor"),
+            token_details=token_details,
         )
         return
 
@@ -493,6 +507,13 @@ async def open_position(decision, call):
         "holders": call.get("holders"),
         "age_minutes": call.get("age_minutes"),
         "bundled_pct": call.get("bundled_pct"),
+        # Jupiter detail fields captured at entry (added 15 Aug 2026). Stored
+        # on the position so data_loader can read them straight out of
+        # positions.json alongside the outcome, with no join to calls.jsonl.
+        # Written whether or not a value came back, so the column exists from
+        # day one rather than appearing halfway through the dataset.
+        **{column: token_details.get(column)
+           for column in market_data.DETAIL_COLUMNS},
         # DCA
         "fills": [
             {"stage": 1, "sol": first["sol"], "mc": entry_mc,
@@ -513,7 +534,8 @@ async def open_position(decision, call):
     POSITIONS[contract] = position
     save_positions(POSITIONS)
 
-    data_logger.log_call("bought", call, decision, live_mc=live_mc)
+    data_logger.log_call("bought", call, decision, live_mc=live_mc,
+                         token_details=token_details)
     data_logger.log_fill("buy", position, first["sol"], entry_mc, stage=1)
 
     log.info(
