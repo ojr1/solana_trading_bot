@@ -687,6 +687,29 @@ async def check_dca_fills(position, current_mc):
     if current_mc > trigger_mc:
         return None
 
+    # POSITION SIZE CAP (Stage 3 safety, 28 Aug 2026). Under normal operation
+    # a position's tranches can never sum past MAX_POSITION_SOL - the
+    # upfront on_message() gate already rejects any call whose planned
+    # aggregate exceeds it, and tranches are just fixed fractions of that
+    # already-approved total. But a position opened under an OLDER, larger
+    # sizing regime can still have pending tranches on disk sized for that
+    # regime - if MAX_POSITION_SOL is later lowered (as this stage does,
+    # 0.4 -> 0.15), those tranches could take the position over the NEW cap.
+    # Abandoned rather than retried: nothing about the wallet's state can
+    # ever make an already-too-large tranche fit under a fixed cap, so
+    # leaving it pending would just repeat this log line every cycle forever.
+    prospective_total = position["sol_invested"] + next_tranche["sol"]
+    if prospective_total > config.MAX_POSITION_SOL:
+        log.warning(
+            "DCA   %-10s tranche %d ABANDONED: would take position to "
+            "%.3f SOL, over the %.3f SOL cap - likely opened under an "
+            "older, larger sizing regime. Not retried.",
+            position["ticker"], next_tranche["stage"], prospective_total,
+            config.MAX_POSITION_SOL,
+        )
+        position["pending_tranches"].pop(0)
+        return None
+
     # RESERVE CHECK (Stage 1 safety, 27 Aug 2026). "Before any buy" applies
     # to every DCA tranche, not just the first. The trigger condition above
     # is left intact (not popped) so a blocked tranche is simply retried on
@@ -1091,9 +1114,15 @@ async def main():
 
     # Guards against running with a mismatched entry_logic version - the
     # exact failure mode that produced a monitor-loop crash on every cycle.
-    if getattr(entry_logic, "MIN_BUY_SOL", None) != 0.10:
+    #
+    # Since Stage 3, MIN_BUY_SOL is an alias for config.MIN_BUY_SOL rather
+    # than an independent hardcoded value, so this now also fires if
+    # MIN_BUY_SOL is deliberately changed via .env, not only if the file
+    # itself is stale - update the expected value below alongside .env if
+    # that is ever done on purpose.
+    if getattr(entry_logic, "MIN_BUY_SOL", None) != 0.075:
         log.warning(
-            "src/entry_logic.py looks OUTDATED (MIN_BUY_SOL=%s, expected 0.1). "
+            "src/entry_logic.py looks OUTDATED (MIN_BUY_SOL=%s, expected 0.075). "
             "DCA tranching will not behave as designed.",
             getattr(entry_logic, "MIN_BUY_SOL", "missing"),
         )

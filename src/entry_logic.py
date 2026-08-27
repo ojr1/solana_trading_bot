@@ -7,6 +7,9 @@ splits across multiple buys.
 
 This module is pure logic. It performs no trading, touches no wallet, and
 makes no network calls, so it can be tested offline:  python src/entry_logic.py
+It does import config.py for the three sizing values below (Stage 3), so it
+still makes no network calls itself, but a valid .env is now required to
+import this module at all - config.py validates at its own import time.
 
 Structure of the PCR:
 
@@ -16,6 +19,8 @@ Structure of the PCR:
     lot   = MIN_LOT + PCR * (MAX_LOT - MIN_LOT)
 """
 
+import config
+
 # ==========================================================================
 # TUNABLE PARAMETERS
 #
@@ -24,10 +29,15 @@ Structure of the PCR:
 # numbers are calibrated against logged results.
 # ==========================================================================
 
-# --- Position sizing -------------------------------------------------------
-MIN_LOT_SOL = 0.2          # total committed to a call at PCR = 0
-MAX_LOT_SOL = 0.5          # total committed to a call at PCR = 1
-MIN_BUY_SOL = 0.10         # smallest permitted individual buy transaction
+# --- Position sizing --------------------------------------------------------
+# MIN_LOT_SOL, MAX_LOT_SOL and MIN_BUY_SOL live in config.py / .env (Stage 3,
+# small-wallet sizing) rather than being hardcoded here, so wallet size can
+# be re-tuned without a code change - consistent with every other setting
+# stage 1 already moved. Kept as module-level aliases so every reference
+# below (pcr_to_lot_size, split_into_tranches) is unchanged.
+MIN_LOT_SOL = config.MIN_LOT_SOL   # total committed to a call at PCR = 0
+MAX_LOT_SOL = config.MAX_LOT_SOL   # total committed to a call at PCR = 1
+MIN_BUY_SOL = config.MIN_BUY_SOL   # smallest permitted individual buy transaction
 MAX_TRANCHES = 3           # most buys a single call may be split across
 
 # --- Weights (must sum to 1.0) ---------------------------------------------

@@ -156,6 +156,28 @@ PRIORITY_FEE_LAMPORTS = _as_int(
     "PRIORITY_FEE_LAMPORTS", _require("PRIORITY_FEE_LAMPORTS"), min_value=0
 )
 
+# --- Entry sizing (Stage 3, moved from entry_logic.py) ---------------------
+# entry_logic.py's pcr_to_lot_size() interpolates between these two for the
+# total lot committed to one call; split_into_tranches() will not use a
+# stage whose amount would fall below MIN_BUY_SOL. Kept here rather than
+# hardcoded in entry_logic.py so wallet size can be re-tuned via .env alone,
+# consistent with every other setting in this file.
+MIN_LOT_SOL = _as_float(
+    "MIN_LOT_SOL", _require("MIN_LOT_SOL"), min_value=0.0001
+)
+MAX_LOT_SOL = _as_float(
+    "MAX_LOT_SOL", _require("MAX_LOT_SOL"), min_value=0.0001
+)
+if MAX_LOT_SOL < MIN_LOT_SOL:
+    raise ConfigError(
+        f"MAX_LOT_SOL ({MAX_LOT_SOL}) is below MIN_LOT_SOL ({MIN_LOT_SOL}) - "
+        f"the PCR interpolation in entry_logic.py requires MAX_LOT_SOL >= MIN_LOT_SOL."
+    )
+
+MIN_BUY_SOL = _as_float(
+    "MIN_BUY_SOL", _require("MIN_BUY_SOL"), min_value=0.0001
+)
+
 
 # ---------------------------------------------------------------------------
 # Startup logging - every secret masked
@@ -190,6 +212,9 @@ def log_resolved_config():
     log.info("config: MIN_SOL_RESERVE=%s SOL", MIN_SOL_RESERVE)
     log.info("config: SLIPPAGE_BPS=%s (%.2f%%)", SLIPPAGE_BPS, SLIPPAGE_BPS / 100)
     log.info("config: PRIORITY_FEE_LAMPORTS=%s", PRIORITY_FEE_LAMPORTS)
+    log.info("config: MIN_LOT_SOL=%s SOL", MIN_LOT_SOL)
+    log.info("config: MAX_LOT_SOL=%s SOL", MAX_LOT_SOL)
+    log.info("config: MIN_BUY_SOL=%s SOL", MIN_BUY_SOL)
     log.info("config: TELEGRAM_API_ID=%s", _mask(str(TELEGRAM_API_ID)))
     log.info("config: TELEGRAM_API_HASH=%s", _mask(TELEGRAM_API_HASH))
     log.info("config: TELEGRAM_CHANNEL=%s", TELEGRAM_CHANNEL)
