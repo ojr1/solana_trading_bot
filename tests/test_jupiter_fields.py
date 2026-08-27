@@ -72,6 +72,20 @@ async def _stub_fetch_token_details(session, mints):
 
 runner.market_data.fetch_token_details = _stub_fetch_token_details
 
+# Stage 1 safety guards (added 27 Aug 2026, after this file) are not what
+# this file tests - it is about Jupiter field plumbing. Stubbed out the same
+# way as fetch_token_details above, rather than depending on the real
+# (small) wallet balance or being incidentally blocked by MAX_POSITION_SOL.
+# Both guards have their own dedicated tests in tests/test_safety.py.
+
+
+async def _stub_get_balance():
+    return 100.0
+
+
+runner.wallet.get_balance = _stub_get_balance
+runner.config.MAX_POSITION_SOL = 999.0
+
 FULL_DETAILS = {
     "market_cap": 24_500.0,
     "top_holders_pct": 21.7,

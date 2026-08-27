@@ -100,6 +100,14 @@ def isolated_state():
     directory (never written to data/*.jsonl). Also fixes the trading window
     open, so tests do not depend on the real time of day.
 
+    Also isolates from the two Stage 1 safety guards (added 27 Aug 2026)
+    added since these tests were written, since neither is what these tests
+    are about: wallet.get_balance() is mocked to a large balance so the real
+    (small) wallet balance never incidentally trips the reserve check, and
+    MAX_POSITION_SOL is raised so a fixture sized for a 0.5 SOL total lot
+    (PCR at or near 1.0) is not incidentally blocked by the 0.4 SOL cap.
+    Both guards have their own dedicated tests in tests/test_safety.py.
+
     Yields (positions_dict, calls_jsonl_path).
     """
     tmpdir = tempfile.mkdtemp(prefix="sol_bot_test_")
@@ -115,6 +123,9 @@ def isolated_state():
         mock.patch.object(data_logger, "SNAPSHOTS_FILE", tmp_path / "snapshots.jsonl"),
         mock.patch.object(runner.trading_window, "window_status",
                            lambda *a, **k: (True, "test - always open")),
+        mock.patch.object(runner.wallet, "get_balance",
+                           mock.AsyncMock(return_value=100.0)),
+        mock.patch.object(runner.config, "MAX_POSITION_SOL", 999.0),
     ]
     for p in patches:
         p.start()

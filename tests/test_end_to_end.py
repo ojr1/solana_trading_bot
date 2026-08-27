@@ -93,6 +93,21 @@ async def stub_fetch_market_caps(session, mints):
 runner.market_data.fetch_token_details = stub_fetch_token_details
 runner.market_data.fetch_market_caps = stub_fetch_market_caps
 
+# Stage 1 safety guards (added 27 Aug 2026, after this file) are not what
+# this file tests - it is the full entry -> monitor -> exit -> disk seam.
+# Stubbed the same way as the market_data functions above, rather than
+# depending on the real (small) wallet balance or being incidentally
+# blocked by MAX_POSITION_SOL across 40 simulated positions. Both guards
+# have their own dedicated tests in tests/test_safety.py.
+
+
+async def _stub_get_balance():
+    return 100.0
+
+
+runner.wallet.get_balance = _stub_get_balance
+runner.config.MAX_POSITION_SOL = 999.0
+
 
 def make_call(contract, ticker, market_cap, index):
     return {

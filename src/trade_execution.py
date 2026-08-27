@@ -9,42 +9,126 @@ via Jupiter. Roadmap Step 2, all points now implemented:
   4. confirm_transaction() — polls until finalised on-chain
   5. execute_swap() — orchestrates all of the above
 
-execute_swap() is NOT wired into main() — calling it with a real mint and
-amount executes a REAL trade. main() below only runs the read-only quote
-test and never touches signing or submission.
+execute_swap() is NOT wired into runner.py's live pipeline - calling it with
+a real mint and amount executes a REAL trade, but nothing in the dry-run bot
+calls it. main() below only runs the read-only quote test and never touches
+signing or submission.
+
+STAGE 1 SAFETY (added 27 Aug 2026):
+
+- SLIPPAGE_BPS and PRIORITY_FEE_LAMPORTS now default from config.py rather
+  than a hardcoded 100 bps and no priority fee at all. Both legs (buy and
+  sell) go through execute_swap(), so both use the same config values.
+- Every network call has an explicit timeout and bounded retries with
+  exponential backoff via _request_with_retries() - no more unbounded waits,
+  and no more a single dropped packet failing a swap outright.
+- execute_swap() now checks config.DRY_RUN itself, at the point closest to
+  signing, rather than relying on every future caller to remember to check
+  first. While DRY_RUN is true it logs exactly what would have been
+  submitted - mint, amount, resolved slippage and priority fee, and the
+  expected output from a real quote - and returns without ever calling
+  build_signed_transaction() or submit_transaction(). This is on top of, not
+  instead of, the fact that nothing currently calls execute_swap() at all.
+- confirm_transaction() returning False used to just flow through
+  execute_swap() as a soft `"confirmed": False` field in the result dict -
+  easy for a future caller to overlook and treat as a success. It now raises
+  FillNotConfirmedError instead: an unconfirmed fill is an abandoned trade,
+  never assumed to have happened, and a caller cannot accidentally ignore it
+  by not checking a field.
 """
 
-import os
 import asyncio
 import base64
+import logging
+
 import aiohttp
-from dotenv import load_dotenv
 from solders.transaction import VersionedTransaction
 from solders import message as solders_message
+
+import config
 from wallet import get_keypair, public_key as wallet_public_key
 
-load_dotenv()
+log = logging.getLogger("trade_execution")
 
-JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
 JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
 JUPITER_SWAP_URL = "https://api.jup.ag/swap/v1/swap"
-HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL")
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
 # mint = the unique on-chain address identifying a specific token (SOL's is this fixed constant)
 
+# Every network call in this file uses this timeout and this retry policy.
+# MAX_RETRIES total attempts, waiting RETRY_BACKOFF_BASE_SECONDS * 2^(n-1)
+# between them (1s, 2s, 4s), then the attempt is abandoned - never retried
+# forever, and never silently treated as having succeeded.
+REQUEST_TIMEOUT_SECONDS = 10
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE_SECONDS = 1.0
 
-async def get_quote(output_mint: str, amount_sol: float, slippage_bps: int = 100) -> dict:
+
+class FillNotConfirmedError(Exception):
+    """
+    A transaction was submitted but never confirmed on-chain within the
+    timeout. The trade is abandoned - it must NEVER be treated as filled.
+    Stale, assumed fills bypassing entry guards have caused real losses.
+    """
+
+
+def _jupiter_headers():
+    return {"x-api-key": config.JUPITER_API_KEY} if config.JUPITER_API_KEY else {}
+
+
+async def _request_with_retries(session, method, url, **kwargs):
+    """
+    Runs one HTTP request with a timeout and bounded exponential backoff.
+
+    method is "get" or "post". On a transient failure (network error or
+    timeout) it retries up to MAX_RETRIES times total; after the last
+    attempt it raises rather than retrying forever, so a call site never
+    hangs indefinitely and never has to guess whether "no response yet"
+    means "still trying" or "gave up silently".
+    """
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    request = getattr(session, method)
+
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with request(url, timeout=timeout, **kwargs) as response:
+                return await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last_exc = exc
+            if attempt == MAX_RETRIES:
+                break
+            backoff = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            log.warning(
+                "%s %s failed (attempt %d/%d): %s - retrying in %.1fs",
+                method.upper(), url, attempt, MAX_RETRIES, exc, backoff,
+            )
+            await asyncio.sleep(backoff)
+
+    log.error("%s %s abandoned after %d attempts: %s",
+              method.upper(), url, MAX_RETRIES, last_exc)
+    raise RuntimeError(
+        f"{method.upper()} {url} failed after {MAX_RETRIES} attempts: {last_exc}"
+    )
+
+
+async def get_quote(output_mint: str, amount_sol: float, slippage_bps: int = None) -> dict:
     """
     Asks Jupiter for a swap quote: SOL -> output_mint.
 
     output_mint: the target token's mint address (e.g. a meme coin contract address)
     amount_sol: how much SOL to swap, in SOL (not lamports)
-    slippage_bps: slippage tolerance in basis points [bps = 1/100th of a percent; 100 bps = 1%]
+    slippage_bps: slippage tolerance in basis points [bps = 1/100th of a
+        percent; 100 bps = 1%]. Defaults to config.SLIPPAGE_BPS (2500, i.e.
+        25%) - the same value used for both the buy and the sell leg.
 
     Returns Jupiter's raw quote response — expected output amount, price impact,
     and route. Read-only: no funds move, nothing is signed.
     """
+    if slippage_bps is None:
+        slippage_bps = config.SLIPPAGE_BPS
+
     amount_lamports = int(amount_sol * 1_000_000_000)
 
     params = {
@@ -53,29 +137,39 @@ async def get_quote(output_mint: str, amount_sol: float, slippage_bps: int = 100
         "amount": amount_lamports,
         "slippageBps": slippage_bps,
     }
-    headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(JUPITER_QUOTE_URL, params=params, headers=headers) as response:
-            return await response.json()
+        return await _request_with_retries(
+            session, "get", JUPITER_QUOTE_URL,
+            params=params, headers=_jupiter_headers(),
+        )
 
 
-async def build_signed_transaction(quote: dict) -> bytes:
+async def build_signed_transaction(quote: dict, priority_fee_lamports: int = None) -> bytes:
     """
     Gets the unsigned swap transaction from Jupiter and signs it locally.
     SENSITIVE — this is the moment the private key authorises a transaction.
     Returns signed transaction bytes. Nothing has been broadcast yet.
+
+    priority_fee_lamports defaults to config.PRIORITY_FEE_LAMPORTS. There is
+    no bribe or Jito bundle parameter here - submission is direct through
+    Helius, so this is the only fee lever this bot has.
     """
+    if priority_fee_lamports is None:
+        priority_fee_lamports = config.PRIORITY_FEE_LAMPORTS
+
     payload = {
         "quoteResponse": quote,
         "userPublicKey": str(wallet_public_key),
         "wrapAndUnwrapSol": True,  # auto-converts SOL <-> WSOL, since SOL itself isn't an SPL token
+        "prioritizationFeeLamports": priority_fee_lamports,
     }
-    headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(JUPITER_SWAP_URL, json=payload, headers=headers) as response:
-            data = await response.json()
+        data = await _request_with_retries(
+            session, "post", JUPITER_SWAP_URL,
+            json=payload, headers=_jupiter_headers(),
+        )
 
     unsigned_tx_b64 = data["swapTransaction"]
     raw_tx = VersionedTransaction.from_bytes(base64.b64decode(unsigned_tx_b64))
@@ -102,8 +196,9 @@ async def submit_transaction(signed_tx_bytes: bytes) -> str:
     }
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(HELIUS_RPC_URL, json=payload) as response:
-            data = await response.json()
+        data = await _request_with_retries(
+            session, "post", config.HELIUS_RPC_URL, json=payload,
+        )
 
     if "result" not in data:
         raise RuntimeError(f"Transaction submission failed: {data}")
@@ -115,6 +210,11 @@ async def confirm_transaction(signature: str, timeout_seconds: int = 60) -> bool
     """
     Polls Helius until the transaction is confirmed on-chain, or times out.
     [confirmed = the blockchain has processed and finalised it, not just accepted it]
+
+    Each individual poll has its own REQUEST_TIMEOUT_SECONDS timeout. A
+    single dropped poll does not fail the whole wait - it is logged and the
+    outer loop tries again on its own 2-second cadence, still bounded by
+    timeout_seconds overall, so this can never hang indefinitely.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -122,16 +222,20 @@ async def confirm_transaction(signature: str, timeout_seconds: int = 60) -> bool
         "method": "getSignatureStatuses",
         "params": [[signature], {"searchTransactionHistory": True}],
     }
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
 
     elapsed = 0
     async with aiohttp.ClientSession() as session:
         while elapsed < timeout_seconds:
-            async with session.post(HELIUS_RPC_URL, json=payload) as response:
-                data = await response.json()
-
-            status = data["result"]["value"][0]
-            if status is not None and status.get("confirmationStatus") in ("confirmed", "finalized"):
-                return True
+            try:
+                async with session.post(config.HELIUS_RPC_URL, json=payload,
+                                        timeout=timeout) as response:
+                    data = await response.json()
+                status = data["result"]["value"][0]
+                if status is not None and status.get("confirmationStatus") in ("confirmed", "finalized"):
+                    return True
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                log.warning("Confirmation poll for %s failed: %s - retrying", signature, exc)
 
             await asyncio.sleep(2)
             elapsed += 2
@@ -139,26 +243,60 @@ async def confirm_transaction(signature: str, timeout_seconds: int = 60) -> bool
     return False
 
 
-async def execute_swap(output_mint: str, amount_sol: float, slippage_bps: int = 100) -> dict:
+async def execute_swap(output_mint: str, amount_sol: float,
+                       slippage_bps: int = None, priority_fee_lamports: int = None) -> dict:
     """
-    Full pipeline: quote -> build+sign -> submit -> confirm.
-    SENSITIVE — calling this with a real mint and amount executes a REAL trade.
+    Full pipeline: quote -> (DRY_RUN: log and stop) -> build+sign -> submit -> confirm.
+    SENSITIVE — while DRY_RUN is false, calling this with a real mint and
+    amount executes a REAL trade.
+
+    Raises FillNotConfirmedError if the transaction was submitted but never
+    confirmed - the caller must never treat that as a successful fill.
 
     Returns the transaction signature and the quote used. Note: this does not
     yet parse the actual realised fill amount from the confirmed transaction —
     cross-check the signature on Solscan to see exactly what was received.
     """
+    if slippage_bps is None:
+        slippage_bps = config.SLIPPAGE_BPS
+    if priority_fee_lamports is None:
+        priority_fee_lamports = config.PRIORITY_FEE_LAMPORTS
+
     quote = await get_quote(output_mint, amount_sol, slippage_bps)
     if "outAmount" not in quote:
         raise RuntimeError(f"Quote failed, aborting before any signing: {quote}")
 
-    signed_tx = await build_signed_transaction(quote)
+    if config.DRY_RUN:
+        log.info(
+            "DRY RUN - would submit: %.4f SOL -> %s | slippage %d bps | "
+            "priority fee %d lamports | expected out %s",
+            amount_sol, output_mint, slippage_bps, priority_fee_lamports,
+            quote.get("outAmount"),
+        )
+        return {
+            "signature": None,
+            "confirmed": False,
+            "dry_run": True,
+            "quote": quote,
+            "solscan_url": None,
+        }
+
+    signed_tx = await build_signed_transaction(quote, priority_fee_lamports)
     signature = await submit_transaction(signed_tx)
     confirmed = await confirm_transaction(signature)
 
+    if not confirmed:
+        raise FillNotConfirmedError(
+            f"Transaction {signature} was submitted but never confirmed "
+            f"within the timeout. Trade abandoned - do NOT assume it "
+            f"filled. Check https://solscan.io/tx/{signature} manually "
+            f"before taking any further action on this position."
+        )
+
     return {
         "signature": signature,
-        "confirmed": confirmed,
+        "confirmed": True,
+        "dry_run": False,
         "quote": quote,
         "solscan_url": f"https://solscan.io/tx/{signature}",
     }

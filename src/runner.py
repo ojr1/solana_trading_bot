@@ -9,10 +9,17 @@ runner.py - Stage 3 dry run. Connects every component into a working pipeline.
         -> exit_logic      DCA fills, take profit, stop loss
         -> logs
 
-NOTHING IS TRADED. No wallet is loaded, no key is read, no transaction is
-built. Every fill below is simulated at the market cap observed at that
-moment. DRY_RUN exists as a switch so that live execution can be added later
-without restructuring, but it is not yet wired to anything that could spend.
+NOTHING IS TRADED and no transaction is ever built or signed here. Every fill
+below is simulated at the market cap observed at that moment. DRY_RUN exists
+as a switch so that live execution can be added later without restructuring,
+but it is not yet wired to anything that could spend.
+
+SENSITIVE (added 27 Aug 2026, Stage 1 safety): this file now imports wallet.py
+for the reserve check in check_reserve_ok(), which means wallet.py's module
+level `Keypair.from_base58_string(WALLET_PRIVATE_KEY)` now runs on every
+runner.py startup - the private key IS parsed into memory as a side effect of
+importing wallet, purely to derive the public key that get_balance() reads
+from Helius. Nothing in this file ever calls anything that signs with it.
 
 Two things run at once: the Telegram listener, which reacts to messages as
 they arrive, and the position monitor, which polls on a timer. Python's
@@ -25,29 +32,33 @@ other can proceed.
 import asyncio
 import json
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import aiohttp
-from dotenv import load_dotenv
 from telethon import TelegramClient, events
 
+import config
 import data_logger
 import entry_logic
 import exit_logic
 import market_data
 import parser as message_parser
 import trading_window
+import wallet
 
 # ==========================================================================
 # CONFIGURATION
 # ==========================================================================
 
-# Hard safety switch. While True the bot only ever writes to logs.
-DRY_RUN = True
+# Hard safety switch. While True the bot only ever writes to logs. Sourced
+# from .env via config.py (Stage 1, 27 Aug 2026) rather than hardcoded, so
+# flipping it is a deliberate .env edit rather than a code change - but the
+# value is still validated at import time, so a missing or malformed
+# DRY_RUN in .env fails loudly before this line is ever reached.
+DRY_RUN = config.DRY_RUN
 
 # How often open positions are re-priced, in seconds. One batched request
 # covers every position, so this cost does not grow as positions accumulate.
@@ -113,11 +124,14 @@ MAX_CALL_AGE_SECONDS = 300
 
 # Positions that have closed are kept in the file for later analysis rather
 # than deleted, but are skipped by the monitor.
-load_dotenv()
 
-API_ID = os.getenv("TELEGRAM_API_ID")
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-CHANNEL = os.getenv("TELEGRAM_CHANNEL")
+# Sourced from config.py (Stage 1, 27 Aug 2026), which validates these at
+# import time - by the time this line runs, import config above has already
+# either succeeded or crashed with a specific "X is missing from .env"
+# message, so these are never None here in practice.
+API_ID = config.TELEGRAM_API_ID
+API_HASH = config.TELEGRAM_API_HASH
+CHANNEL = config.TELEGRAM_CHANNEL
 
 
 # ==========================================================================
@@ -325,6 +339,55 @@ def is_call_stale(message_date, now=None):
 
 
 # ==========================================================================
+# WALLET RESERVE (Stage 1 safety, 27 Aug 2026)
+#
+# The reserve exists so the bot can always afford to sell what it holds.
+# Its claims are token account rent of roughly 0.002 SOL per open position
+# and a priority fee of roughly 0.000125 SOL per exit transaction. At
+# MAX_CONCURRENT_POSITIONS (6) that is about 6 * (0.002 + 0.000125) =
+# 0.0128 SOL - comfortably inside MIN_SOL_RESERVE's default of 0.05 SOL, so
+# the reserve floor is headroom above what closing every open position would
+# actually cost, not a tight estimate of it.
+# ==========================================================================
+
+
+async def check_reserve_ok(trade_size_sol):
+    """
+    True if the wallet can afford trade_size_sol AND keep the safety reserve.
+
+    Calls wallet.get_balance() - a real, read-only Helius RPC call using only
+    the wallet's PUBLIC key. Runs even while DRY_RUN is true and no real
+    trade will follow, so the guard's logic is proven correct against the
+    real balance before it is ever relied on for a real trade.
+
+    FAILS CLOSED: if the balance cannot be fetched at all (Helius down,
+    timed out after retries), this blocks the trade rather than crashing the
+    bot or letting it through unchecked - an unknown balance is treated the
+    same as an insufficient one, consistent with 2b: never assume, infer, or
+    proceed on missing information.
+    """
+    try:
+        balance = await wallet.get_balance()
+    except RuntimeError as exc:
+        log.warning(
+            "RESERVE BLOCK could not fetch wallet balance, refusing to buy "
+            "blind: %s", exc,
+        )
+        return False
+
+    open_count = sum(1 for p in POSITIONS.values() if not p["closed"])
+
+    if balance - trade_size_sol < config.MIN_SOL_RESERVE:
+        log.warning(
+            "RESERVE BLOCK balance=%.4f SOL  trade_size=%.4f SOL  "
+            "reserve_floor=%.4f SOL  open_positions=%d",
+            balance, trade_size_sol, config.MIN_SOL_RESERVE, open_count,
+        )
+        return False
+    return True
+
+
+# ==========================================================================
 # NOTIONAL ACCOUNTING
 #
 # The dry run never receives a real fill, so there is no token quantity to
@@ -402,6 +465,21 @@ async def open_position(decision, call):
     tranches = decision["tranches"]
     first = tranches[0]
     call_mc = call["market_cap"]
+
+    # RESERVE CHECK (Stage 1 safety, 27 Aug 2026). Checked before the price
+    # fetch below - trade_size does not depend on price, so there is no
+    # reason to spend a Jupiter call finding out the reserve was already
+    # going to block this fill.
+    if not await check_reserve_ok(first["sol"]):
+        log.info(
+            "REJECT %-9s reserve floor would be breached  | trade %.3f SOL",
+            decision["ticker"], first["sol"],
+        )
+        data_logger.log_call(
+            "rejected_reserve", call, decision,
+            reason="buying this would breach MIN_SOL_RESERVE",
+        )
+        return
 
     # ONE fetch, returning the live price AND the extra Jupiter fields added
     # 15 Aug 2026. This is the only place they are collected: the 5-second
@@ -557,7 +635,7 @@ async def open_position(decision, call):
 # ==========================================================================
 
 
-def check_dca_fills(position, current_mc):
+async def check_dca_fills(position, current_mc):
     """
     Fills the next pending tranche if the price has dropped far enough.
 
@@ -607,6 +685,18 @@ def check_dca_fills(position, current_mc):
     trigger_mc = position["last_fill_mc"] * (1 - drop)
 
     if current_mc > trigger_mc:
+        return None
+
+    # RESERVE CHECK (Stage 1 safety, 27 Aug 2026). "Before any buy" applies
+    # to every DCA tranche, not just the first. The trigger condition above
+    # is left intact (not popped) so a blocked tranche is simply retried on
+    # the next cycle once the wallet has room again, rather than being lost.
+    if not await check_reserve_ok(next_tranche["sol"]):
+        log.info(
+            "DCA   %-10s tranche %d skipped: reserve floor would be breached "
+            "| trade %.3f SOL",
+            position["ticker"], next_tranche["stage"], next_tranche["sol"],
+        )
         return None
 
     # Fill it.
@@ -766,7 +856,7 @@ async def _monitor_once(session):
         if current_mc is None:
             continue
 
-        fill = check_dca_fills(position, current_mc)
+        fill = await check_dca_fills(position, current_mc)
         if fill:
             changed = True
             log.info(
@@ -905,6 +995,23 @@ async def on_message(event):
         )
         return
 
+    # Concurrency cap (Stage 1 safety, 27 Aug 2026). A wallet has finite SOL
+    # to fund exits from, so the number of positions open at once is bounded
+    # regardless of how many good calls arrive - see MAX_POSITION_SOL below
+    # for the matching per-coin cap.
+    open_count = sum(1 for p in POSITIONS.values() if not p["closed"])
+    if open_count >= config.MAX_CONCURRENT_POSITIONS:
+        log.info(
+            "SKIP  %-10s concurrency cap reached (%d/%d open positions)",
+            parsed["ticker"], open_count, config.MAX_CONCURRENT_POSITIONS,
+        )
+        data_logger.log_call(
+            "rejected_concurrency_cap", parsed,
+            reason=(f"{open_count} of {config.MAX_CONCURRENT_POSITIONS} "
+                    f"concurrent positions already open"),
+        )
+        return
+
     # Time-of-day gate. Checked before the PCR is scored, because there is no
     # point valuing a call that cannot be acted on.
     #
@@ -951,6 +1058,23 @@ async def on_message(event):
         data_logger.log_call("rejected", parsed, decision)
         return
 
+    # Position size cap (Stage 1 safety, 27 Aug 2026). total_lot_sol is the
+    # AGGREGATE planned commitment across every DCA tranche, not one tranche
+    # - entry_logic.split_into_tranches divides exactly this figure - so
+    # checking it once, here, before the first tranche fills, enforces the
+    # cap across the whole position rather than per-buy.
+    if decision["total_lot_sol"] > config.MAX_POSITION_SOL:
+        log.info(
+            "REJECT %-9s planned lot %.3f SOL exceeds MAX_POSITION_SOL %.3f SOL",
+            parsed["ticker"], decision["total_lot_sol"], config.MAX_POSITION_SOL,
+        )
+        data_logger.log_call(
+            "rejected_position_size_cap", parsed, decision,
+            reason=(f"planned lot {decision['total_lot_sol']:.3f} SOL exceeds "
+                    f"the {config.MAX_POSITION_SOL:.3f} SOL cap"),
+        )
+        return
+
     await open_position(decision, parsed)
 
 
@@ -960,11 +1084,10 @@ async def on_message(event):
 
 
 async def main():
-    if not API_ID or not API_HASH or not CHANNEL:
-        raise SystemExit(
-            "Missing credentials. Check .env contains TELEGRAM_API_ID, "
-            "TELEGRAM_API_HASH and TELEGRAM_CHANNEL."
-        )
+    # Credential presence/shape is already validated by `import config` above
+    # (it fails loudly there, before this function is even reached), so the
+    # old runtime check that used to live here is redundant and was removed
+    # rather than duplicating config.py's own validation.
 
     # Guards against running with a mismatched entry_logic version - the
     # exact failure mode that produced a monitor-loop crash on every cycle.
@@ -993,10 +1116,13 @@ async def main():
             )
 
     log.info("=" * 66)
-    log.info("DRY RUN - no wallet loaded, no trades executed")
+    log.info("DRY RUN - simulated fills only, no transaction is ever signed or submitted")
     log.info("channel: %s | polling every %ss", CHANNEL, POLL_INTERVAL_SECONDS)
     open_count = sum(1 for p in POSITIONS.values() if not p["closed"])
     log.info("restored %d position(s), %d still open", len(POSITIONS), open_count)
+
+    log.info("-" * 66)
+    config.log_resolved_config()
 
     # Print the guards at startup so the log itself records which version of
     # the rules produced a session's trades. The 10 Aug optimisation was
@@ -1023,7 +1149,9 @@ async def main():
 
 if __name__ == "__main__":
     if not DRY_RUN:
-        raise SystemExit("Live execution is not implemented. Keep DRY_RUN = True.")
+        raise SystemExit(
+            "Live execution is not implemented. Set DRY_RUN=true in .env."
+        )
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
