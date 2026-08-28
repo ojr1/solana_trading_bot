@@ -42,6 +42,7 @@ from pathlib import Path
 import aiohttp
 from telethon import TelegramClient, events
 
+import alerting
 import config
 import data_logger
 import entry_logic
@@ -407,6 +408,64 @@ async def check_reserve_ok(trade_size_sol):
     return True
 
 
+def check_daily_loss_ok(now=None):
+    """
+    True if today's realised P&L across positions CLOSED TODAY has not
+    breached -MAX_DAILY_LOSS_SOL. On breach, blocks NEW ENTRIES ONLY - open
+    positions are never force-flattened here (decided in
+    LIVE_EXECUTION_PLAN.md and brief_stage10_autonomous.md: a forced exit at
+    an arbitrary moment is worse than continued managed exposure).
+
+    "Today" is the UTC CALENDAR DAY of each closed position's closed_at
+    timestamp - a hard midnight-UTC boundary, not a rolling 24h window.
+    Every timestamp already written anywhere in this codebase
+    (datetime.now(timezone.utc).isoformat(), used throughout this file) is
+    UTC, so this needs no timezone conversion, only a .date() comparison
+    against "now"'s own UTC date. A position that closed at 23:59:59 UTC
+    counts toward that day; one closed a second later counts toward the
+    next - matches how a human reads "today has been a bad day", not a
+    precise trading-session definition.
+
+    Positions with no closed_at (legacy records from before that field
+    existed, or anything still open) are excluded from the sum - they are
+    either not part of "today" at all, or not yet closed to have a realised
+    P&L in the first place.
+
+    now: injectable UTC datetime, matching the is_call_stale()/
+    stale_fetch_gap_seconds() pattern already used in this file - defaults
+    to the real current time, but lets tests exercise the midnight boundary
+    exactly rather than depending on when the test happens to run.
+
+    No network call, so this runs before check_reserve_ok() at the call
+    site: cheapest check first, same reasoning open_position() already uses
+    for running check_reserve_ok() before the live price fetch.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    today = now.date()
+    todays_pnl = sum(
+        p["realised_sol"] - p["sol_invested"]
+        for p in POSITIONS.values()
+        if p["closed"] and p.get("closed_at")
+        and datetime.fromisoformat(p["closed_at"]).astimezone(timezone.utc).date() == today
+    )
+
+    if todays_pnl < -config.MAX_DAILY_LOSS_SOL:
+        log.warning(
+            "DAILY LOSS CAP HIT today's P&L=%.4f SOL breached the -%.4f SOL "
+            "cap - blocking NEW ENTRIES ONLY, open positions are unaffected",
+            todays_pnl, config.MAX_DAILY_LOSS_SOL,
+        )
+        alerting.alert(
+            "daily_loss_cap",
+            f"today's P&L {todays_pnl:+.4f} SOL breached the "
+            f"-{config.MAX_DAILY_LOSS_SOL:.4f} SOL daily loss cap - new "
+            f"entries are blocked until the next UTC day",
+        )
+        return False
+    return True
+
+
 # ==========================================================================
 # NOTIONAL ACCOUNTING
 #
@@ -485,6 +544,21 @@ async def open_position(decision, call):
     tranches = decision["tranches"]
     first = tranches[0]
     call_mc = call["market_cap"]
+
+    # DAILY LOSS CAP (Stage 10, 30 Aug 2026). Checked before the reserve
+    # check below - no network call, so it is the cheapest possible reason
+    # to reject, same reasoning as the reserve check running before the
+    # price fetch. Blocks new entries only; never touches open positions.
+    if not check_daily_loss_ok():
+        log.info(
+            "REJECT %-9s daily loss cap breached  | trade %.3f SOL",
+            decision["ticker"], first["sol"],
+        )
+        data_logger.log_call(
+            "rejected_daily_loss_cap", call, decision,
+            reason="today's realised P&L breached MAX_DAILY_LOSS_SOL",
+        )
+        return
 
     # RESERVE CHECK (Stage 1 safety, 27 Aug 2026). Checked before the price
     # fetch below - trade_size does not depend on price, so there is no

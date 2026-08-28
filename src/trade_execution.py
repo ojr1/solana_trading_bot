@@ -75,9 +75,36 @@ RETRY_BACKOFF_BASE_SECONDS = 1.0
 class FillNotConfirmedError(Exception):
     """
     A transaction was submitted but never confirmed on-chain within the
-    timeout. The trade is abandoned - it must NEVER be treated as filled.
+    timeout. Genuinely UNKNOWN whether it landed - it may still confirm
+    later. The trade must NEVER be treated as filled on this signal alone.
     Stale, assumed fills bypassing entry guards have caused real losses.
     """
+
+
+class TransactionRevertedError(Exception):
+    """
+    A transaction was confirmed on-chain but FAILED - Solana's own
+    getSignatureStatuses `err` field was non-null (e.g. slippage tolerance
+    exceeded). Unlike FillNotConfirmedError, this is a KNOWN outcome: no
+    funds moved for this swap, and it is safe to treat as if it never
+    happened rather than needing to keep polling or investigating.
+    """
+
+
+class TransactionSubmissionError(RuntimeError):
+    """
+    submit_transaction() failed - the network call to broadcast either
+    errored outright or Helius returned no result. Whether the transaction
+    nonetheless reached the network before the failure is NOT knowable from
+    this exception alone. local_signature (derived from the signed bytes,
+    before submission was ever attempted - see build_signed_transaction())
+    is carried so a caller can poll for it later rather than having nothing
+    to check.
+    """
+
+    def __init__(self, message, local_signature=None):
+        super().__init__(message)
+        self.local_signature = local_signature
 
 
 def _jupiter_headers():
@@ -152,11 +179,21 @@ async def get_quote(output_mint: str, amount_sol: float, slippage_bps: int = Non
         )
 
 
-async def build_signed_transaction(quote: dict, priority_fee_lamports: int = None) -> bytes:
+async def build_signed_transaction(quote: dict, priority_fee_lamports: int = None):
     """
     Gets the unsigned swap transaction from Jupiter and signs it locally.
     SENSITIVE — this is the moment the private key authorises a transaction.
-    Returns signed transaction bytes. Nothing has been broadcast yet.
+    Nothing has been broadcast yet.
+
+    Returns (signed_tx_bytes, local_signature) - local_signature (a base58
+    string) is derived from the signature the keypair just produced, not
+    from anything Helius has told us. Stage 10 (30 Aug 2026): captured here,
+    immediately after signing and before submit_transaction() is ever
+    called, so a submission that fails BEFORE a response arrives - network
+    drop, timeout, anything - still leaves a known signature that can be
+    polled for later, rather than genuinely no idea what to check. See
+    TransactionSubmissionError, which carries this value through such a
+    failure.
 
     priority_fee_lamports defaults to config.PRIORITY_FEE_LAMPORTS. There is
     no bribe or Jito bundle parameter here - submission is direct through
@@ -185,7 +222,9 @@ async def build_signed_transaction(quote: dict, priority_fee_lamports: int = Non
     signature = keypair.sign_message(solders_message.to_bytes_versioned(raw_tx.message))
     signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
 
-    return bytes(signed_tx)
+    local_signature = str(signed_tx.signatures[0])
+
+    return bytes(signed_tx), local_signature
 
 
 async def submit_transaction(signed_tx_bytes: bytes) -> str:
@@ -213,15 +252,15 @@ async def submit_transaction(signed_tx_bytes: bytes) -> str:
     return data["result"]
 
 
-async def confirm_transaction(signature: str, timeout_seconds: int = 60) -> bool:
+async def _fetch_signature_status(session, signature):
     """
-    Polls Helius until the transaction is confirmed on-chain, or times out.
-    [confirmed = the blockchain has processed and finalised it, not just accepted it]
-
-    Each individual poll has its own REQUEST_TIMEOUT_SECONDS timeout. A
-    single dropped poll does not fail the whole wait - it is logged and the
-    outer loop tries again on its own 2-second cadence, still bounded by
-    timeout_seconds overall, so this can never hang indefinitely.
+    One poll of getSignatureStatuses for a single signature. Returns the
+    status dict (may carry 'err': absent, null, or a non-null failure
+    detail, plus 'confirmationStatus'), or None if the signature is not yet
+    known to the RPC node at all. Raises on network failure -
+    confirm_transaction()'s polling loop, not this helper, decides whether
+    to log-and-retry. Split out so tests can mock exactly this call without
+    needing to fake aiohttp itself.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -230,24 +269,57 @@ async def confirm_transaction(signature: str, timeout_seconds: int = 60) -> bool
         "params": [[signature], {"searchTransactionHistory": True}],
     }
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    async with session.post(config.HELIUS_RPC_URL, json=payload,
+                            timeout=timeout) as response:
+        data = await response.json()
+    return data["result"]["value"][0]
 
+
+async def confirm_transaction(signature: str, timeout_seconds: int = 60) -> str:
+    """
+    Polls Helius until the transaction resolves on-chain, or times out.
+    [confirmed = the blockchain has processed and finalised it, not just accepted it]
+
+    Returns one of three strings, deliberately not a bool - "timed out
+    waiting" and "confirmed but failed" are different, known-vs-unknown
+    outcomes that callers must be able to tell apart (see
+    LIVE_EXECUTION_PLAN.md's failure taxonomy):
+
+        "confirmed" - landed on-chain and succeeded (err is null or absent)
+        "failed"    - landed on-chain but REVERTED (err is non-null) - a
+                      KNOWN outcome, safe to treat as "nothing happened"
+        "timeout"   - never resolved within timeout_seconds - genuinely
+                      UNKNOWN, must never be assumed either way
+
+    status.get("err") returns None uniformly whether the key is present
+    with a null value or absent entirely, so both are handled identically
+    and correctly by construction - no separate branch needed for "absent".
+
+    Each individual poll has its own REQUEST_TIMEOUT_SECONDS timeout. A
+    single dropped poll does not fail the whole wait - it is logged and the
+    outer loop tries again on its own 2-second cadence, still bounded by
+    timeout_seconds overall, so this can never hang indefinitely.
+    """
     elapsed = 0
     async with aiohttp.ClientSession() as session:
         while elapsed < timeout_seconds:
             try:
-                async with session.post(config.HELIUS_RPC_URL, json=payload,
-                                        timeout=timeout) as response:
-                    data = await response.json()
-                status = data["result"]["value"][0]
+                status = await _fetch_signature_status(session, signature)
                 if status is not None and status.get("confirmationStatus") in ("confirmed", "finalized"):
-                    return True
+                    if status.get("err") is not None:
+                        log.error(
+                            "Transaction %s confirmed but REVERTED on-chain: %s",
+                            signature, status.get("err"),
+                        )
+                        return "failed"
+                    return "confirmed"
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 log.warning("Confirmation poll for %s failed: %s - retrying", signature, exc)
 
             await asyncio.sleep(2)
             elapsed += 2
 
-    return False
+    return "timeout"
 
 
 async def execute_swap(output_mint: str, amount_sol: float,
@@ -258,7 +330,11 @@ async def execute_swap(output_mint: str, amount_sol: float,
     amount executes a REAL trade.
 
     Raises FillNotConfirmedError if the transaction was submitted but never
-    confirmed - the caller must never treat that as a successful fill.
+    confirmed within the timeout - genuinely unknown, may still land later.
+    Raises TransactionRevertedError if it confirmed but FAILED on-chain -
+    known outcome, no funds moved. Raises TransactionSubmissionError
+    (carrying local_signature) if submission itself failed. The caller must
+    never treat any of these as a successful fill.
 
     Returns the transaction signature and the quote used. Note: this does not
     yet parse the actual realised fill amount from the confirmed transaction —
@@ -288,11 +364,35 @@ async def execute_swap(output_mint: str, amount_sol: float,
             "solscan_url": None,
         }
 
-    signed_tx = await build_signed_transaction(quote, priority_fee_lamports)
-    signature = await submit_transaction(signed_tx)
-    confirmed = await confirm_transaction(signature)
+    signed_tx_bytes, local_signature = await build_signed_transaction(
+        quote, priority_fee_lamports,
+    )
 
-    if not confirmed:
+    try:
+        signature = await submit_transaction(signed_tx_bytes)
+    except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as exc:
+        # Submission itself failed - whether the transaction nonetheless
+        # reached the network is NOT knowable from this exception alone.
+        # local_signature (captured before this call was ever attempted) is
+        # the one thing that lets a caller check later rather than guessing.
+        raise TransactionSubmissionError(
+            f"submit_transaction failed for locally-signed tx "
+            f"{local_signature}: {exc}. Whether it landed anyway is "
+            f"unknown - poll this signature before assuming either outcome.",
+            local_signature=local_signature,
+        ) from exc
+
+    status = await confirm_transaction(signature)
+
+    if status == "failed":
+        raise TransactionRevertedError(
+            f"Transaction {signature} was confirmed on-chain but REVERTED "
+            f"(failed) - no funds moved. Check "
+            f"https://solscan.io/tx/{signature} for the reason (e.g. "
+            f"slippage tolerance exceeded)."
+        )
+
+    if status == "timeout":
         raise FillNotConfirmedError(
             f"Transaction {signature} was submitted but never confirmed "
             f"within the timeout. Trade abandoned - do NOT assume it "

@@ -178,6 +178,16 @@ PRIORITY_FEE_LAMPORTS = _as_int(
     "PRIORITY_FEE_LAMPORTS", _require("PRIORITY_FEE_LAMPORTS"), min_value=0
 )
 
+# Account-wide backstop, distinct from the per-position stop-loss: how much
+# CAN be lost across all positions closed today before new entries are
+# blocked. Stage 10 (30 Aug 2026) - see runner.check_daily_loss_ok() for how
+# "today" is scoped and what a breach does (blocks new entries only; open
+# positions are never force-flattened - decided in LIVE_EXECUTION_PLAN.md
+# and brief_stage10_autonomous.md, not re-opened here).
+MAX_DAILY_LOSS_SOL = _as_float(
+    "MAX_DAILY_LOSS_SOL", _require("MAX_DAILY_LOSS_SOL"), min_value=0.0001
+)
+
 # --- Entry sizing (Stage 3, moved from entry_logic.py) ---------------------
 # entry_logic.py's pcr_to_lot_size() interpolates between these two for the
 # total lot committed to one call; split_into_tranches() will not use a
@@ -246,6 +256,7 @@ def log_resolved_config():
     log.info("config: MIN_SOL_RESERVE=%s SOL", MIN_SOL_RESERVE)
     log.info("config: SLIPPAGE_BPS=%s (%.2f%%)", SLIPPAGE_BPS, SLIPPAGE_BPS / 100)
     log.info("config: PRIORITY_FEE_LAMPORTS=%s", PRIORITY_FEE_LAMPORTS)
+    log.info("config: MAX_DAILY_LOSS_SOL=%s SOL", MAX_DAILY_LOSS_SOL)
     log.info("config: MIN_LOT_SOL=%s SOL", MIN_LOT_SOL)
     log.info("config: MAX_LOT_SOL=%s SOL", MAX_LOT_SOL)
     log.info("config: MIN_BUY_SOL=%s SOL", MIN_BUY_SOL)

@@ -34,6 +34,7 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+import alerting         # noqa: E402
 import config          # noqa: E402
 import data_logger     # noqa: E402
 import exit_logic      # noqa: E402
@@ -200,16 +201,128 @@ def test_unconfirmed_fill_is_never_treated_as_filled(monkeypatch):
     monkeypatch.setattr(trade_execution, "get_quote",
                         AsyncMock(return_value={"outAmount": "12345"}))
     monkeypatch.setattr(trade_execution, "build_signed_transaction",
-                        AsyncMock(return_value=b"fake-signed-tx"))
+                        AsyncMock(return_value=(b"fake-signed-tx", "fake-local-sig")))
     monkeypatch.setattr(trade_execution, "submit_transaction",
                         AsyncMock(return_value="fake-signature"))
     monkeypatch.setattr(trade_execution, "confirm_transaction",
-                        AsyncMock(return_value=False))  # never confirms
+                        AsyncMock(return_value="timeout"))  # never confirms
 
     with pytest.raises(trade_execution.FillNotConfirmedError):
         asyncio.run(trade_execution.execute_swap(
             "TestMintUnconfirmed11111111111111111111111", 0.05
         ))
+
+
+# ---------------------------------------------------------------------------
+# STAGE 10 - execute_swap()'s three-way confirm_transaction() outcome,
+# brief_stage10_autonomous.md Part 1
+# ---------------------------------------------------------------------------
+
+
+def test_reverted_fill_raises_transaction_reverted_not_treated_as_filled(monkeypatch):
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(trade_execution, "get_quote",
+                        AsyncMock(return_value={"outAmount": "12345"}))
+    monkeypatch.setattr(trade_execution, "build_signed_transaction",
+                        AsyncMock(return_value=(b"fake-signed-tx", "fake-local-sig")))
+    monkeypatch.setattr(trade_execution, "submit_transaction",
+                        AsyncMock(return_value="fake-signature"))
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="failed"))  # confirmed but reverted
+
+    with pytest.raises(trade_execution.TransactionRevertedError):
+        asyncio.run(trade_execution.execute_swap(
+            "TestMintReverted111111111111111111111111", 0.05
+        ))
+
+
+def test_confirmed_fill_returns_success(monkeypatch):
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(trade_execution, "get_quote",
+                        AsyncMock(return_value={"outAmount": "12345"}))
+    monkeypatch.setattr(trade_execution, "build_signed_transaction",
+                        AsyncMock(return_value=(b"fake-signed-tx", "fake-local-sig")))
+    monkeypatch.setattr(trade_execution, "submit_transaction",
+                        AsyncMock(return_value="fake-signature"))
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="confirmed"))
+
+    result = asyncio.run(trade_execution.execute_swap(
+        "TestMintConfirmed11111111111111111111111", 0.05
+    ))
+
+    assert result["confirmed"] is True
+    assert result["signature"] == "fake-signature"
+
+
+def test_submission_failure_carries_local_signature_forward(monkeypatch):
+    """
+    A network-level failure at submit_transaction() must not lose the one
+    thing that lets a later poll figure out what actually happened: the
+    signature captured locally right after signing, before submission was
+    ever attempted.
+    """
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(trade_execution, "get_quote",
+                        AsyncMock(return_value={"outAmount": "12345"}))
+    monkeypatch.setattr(trade_execution, "build_signed_transaction",
+                        AsyncMock(return_value=(b"fake-signed-tx", "fake-local-sig-999")))
+    monkeypatch.setattr(trade_execution, "submit_transaction",
+                        AsyncMock(side_effect=RuntimeError("network drop")))
+
+    with pytest.raises(trade_execution.TransactionSubmissionError) as excinfo:
+        asyncio.run(trade_execution.execute_swap(
+            "TestMintSubmitFail1111111111111111111111", 0.05
+        ))
+
+    assert excinfo.value.local_signature == "fake-local-sig-999"
+
+
+# ---------------------------------------------------------------------------
+# STAGE 10 - confirm_transaction()'s own err-field handling, mocked at
+# _fetch_signature_status (one HTTP poll) rather than faking aiohttp itself.
+# ---------------------------------------------------------------------------
+
+
+def test_confirm_transaction_null_err_is_success(monkeypatch):
+    monkeypatch.setattr(
+        trade_execution, "_fetch_signature_status",
+        AsyncMock(return_value={"confirmationStatus": "confirmed", "err": None}),
+    )
+    result = asyncio.run(trade_execution.confirm_transaction("sig", timeout_seconds=5))
+    assert result == "confirmed"
+
+
+def test_confirm_transaction_absent_err_is_success(monkeypatch):
+    """status.get('err') must treat a missing key the same as an explicit
+    null - the field is not always present on a genuinely successful tx."""
+    monkeypatch.setattr(
+        trade_execution, "_fetch_signature_status",
+        AsyncMock(return_value={"confirmationStatus": "finalized"}),  # no 'err' key at all
+    )
+    result = asyncio.run(trade_execution.confirm_transaction("sig", timeout_seconds=5))
+    assert result == "confirmed"
+
+
+def test_confirm_transaction_non_null_err_is_failed(monkeypatch):
+    monkeypatch.setattr(
+        trade_execution, "_fetch_signature_status",
+        AsyncMock(return_value={
+            "confirmationStatus": "confirmed",
+            "err": {"InstructionError": [0, "slippage tolerance exceeded"]},
+        }),
+    )
+    result = asyncio.run(trade_execution.confirm_transaction("sig", timeout_seconds=5))
+    assert result == "failed"
+
+
+def test_confirm_transaction_never_resolves_is_timeout(monkeypatch):
+    monkeypatch.setattr(
+        trade_execution, "_fetch_signature_status",
+        AsyncMock(return_value=None),  # signature never seen by the RPC node
+    )
+    result = asyncio.run(trade_execution.confirm_transaction("sig", timeout_seconds=2))
+    assert result == "timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -732,3 +845,96 @@ def test_initials_sells_33_percent_not_50():
     )
     assert position["closed"] is False, \
         "67% remains after initials - the position must stay open"
+
+
+# ---------------------------------------------------------------------------
+# STAGE 10 PART 1 - MAX_DAILY_LOSS_SOL / check_daily_loss_ok(),
+# brief_stage10_autonomous.md
+# ---------------------------------------------------------------------------
+
+
+def test_daily_loss_cap_blocks_new_entries_when_breached(isolated_positions, monkeypatch):
+    positions, _ = isolated_positions
+    monkeypatch.setattr(config, "MAX_DAILY_LOSS_SOL", 0.5)
+    now = datetime(2026, 8, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+    positions["TestLossA" + "9" * 33] = {
+        "closed": True, "closed_at": "2026-08-28T10:00:00+00:00",
+        "sol_invested": 1.0, "realised_sol": 0.4,  # -0.6 SOL, breaches -0.5 cap
+    }
+
+    assert runner.check_daily_loss_ok(now=now) is False
+
+
+def test_daily_loss_cap_allows_when_under_the_cap(isolated_positions, monkeypatch):
+    positions, _ = isolated_positions
+    monkeypatch.setattr(config, "MAX_DAILY_LOSS_SOL", 0.5)
+    now = datetime(2026, 8, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+    positions["TestLossB" + "9" * 33] = {
+        "closed": True, "closed_at": "2026-08-28T10:00:00+00:00",
+        "sol_invested": 1.0, "realised_sol": 0.7,  # -0.3 SOL, under the -0.5 cap
+    }
+
+    assert runner.check_daily_loss_ok(now=now) is True
+
+
+def test_daily_loss_cap_boundary_just_before_and_after_utc_midnight(
+    isolated_positions, monkeypatch,
+):
+    """A position closed at 23:59:59 UTC counts toward that day; one closed
+    a second later (00:00:00 UTC the next day) counts toward the next - a
+    hard date boundary, not a rolling 24h window."""
+    positions, _ = isolated_positions
+    monkeypatch.setattr(config, "MAX_DAILY_LOSS_SOL", 0.5)
+    now = datetime(2026, 8, 28, 23, 59, 59, tzinfo=timezone.utc)
+
+    # Closed one second before midnight on the 28th - counts toward "today" (the 28th).
+    positions["TestBeforeMidnight" + "9" * 24] = {
+        "closed": True, "closed_at": "2026-08-28T23:59:59+00:00",
+        "sol_invested": 1.0, "realised_sol": 0.4,  # -0.6 SOL alone breaches -0.5
+    }
+    assert runner.check_daily_loss_ok(now=now) is False, \
+        "a position closed at 23:59:59 UTC on the 28th must count toward the 28th"
+
+    # Remove it, add one closed exactly at midnight the NEXT day instead -
+    # must NOT count toward "today" (still the 28th per `now` above).
+    positions.clear()
+    positions["TestAfterMidnight" + "9" * 24] = {
+        "closed": True, "closed_at": "2026-08-29T00:00:00+00:00",
+        "sol_invested": 1.0, "realised_sol": 0.4,  # same -0.6 SOL loss
+    }
+    assert runner.check_daily_loss_ok(now=now) is True, \
+        "a position closed at 00:00:00 UTC on the 29th must NOT count toward the 28th"
+
+
+def test_daily_loss_cap_ignores_positions_without_closed_at(isolated_positions, monkeypatch):
+    positions, _ = isolated_positions
+    monkeypatch.setattr(config, "MAX_DAILY_LOSS_SOL", 0.5)
+    now = datetime(2026, 8, 28, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Legacy-shaped closed position with no closed_at - must be excluded,
+    # not crash and not count.
+    positions["TestLegacyNoClosedAt" + "9" * 20] = {
+        "closed": True, "closed_at": None,
+        "sol_invested": 1.0, "realised_sol": 0.0,  # would be -1.0 SOL if counted
+    }
+    assert runner.check_daily_loss_ok(now=now) is True
+
+
+# ---------------------------------------------------------------------------
+# STAGE 10 PART 1 - alerting.alert(), brief_stage10_autonomous.md
+# ---------------------------------------------------------------------------
+
+
+def test_alert_logs_at_error_with_distinctive_prefix(caplog):
+    with caplog.at_level("ERROR", logger="alerting"):
+        alerting.alert("daily_loss_cap", "today's P&L breached the cap")
+
+    assert any(
+        record.levelname == "ERROR"
+        and "[ALERT]" in record.message
+        and "daily_loss_cap" in record.message
+        and "today's P&L breached the cap" in record.message
+        for record in caplog.records
+    )
