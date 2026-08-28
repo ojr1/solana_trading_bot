@@ -1439,3 +1439,93 @@ def test_parse_fill_raises_when_no_matching_token_balance(monkeypatch):
         asyncio.run(trade_execution.parse_fill_from_transaction(
             "sig-nomatch", MINT, owner_pubkey=WALLET,
         ))
+
+
+# ---------------------------------------------------------------------------
+# STAGE 10 PART 5 - sell-direction quote + decimals handling, standalone,
+# not wired in, no sell ever executed. brief_stage10_autonomous.md.
+# Mocked at _request_with_retries (the shared HTTP-with-retries helper) so
+# tests can inspect exactly what would have been sent to Jupiter, with no
+# real network call and nothing signed or submitted.
+# ---------------------------------------------------------------------------
+
+
+def test_get_token_decimals_reads_from_get_token_supply(monkeypatch):
+    async def fake_request(session, method, url, **kwargs):
+        assert method == "post"
+        return {"result": {"value": {"amount": "1000000000000", "decimals": 6,
+                                     "uiAmount": 1_000_000.0}}}
+    monkeypatch.setattr(trade_execution, "_request_with_retries", fake_request)
+
+    decimals = asyncio.run(trade_execution.get_token_decimals(MINT))
+
+    assert decimals == 6
+
+
+def test_get_token_decimals_raises_when_mint_not_found(monkeypatch):
+    async def fake_request(session, method, url, **kwargs):
+        return {"result": None, "error": {"message": "not found"}}
+    monkeypatch.setattr(trade_execution, "_request_with_retries", fake_request)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(trade_execution.get_token_decimals("TestNoSuchMint1111111111111111111111"))
+
+
+def test_get_quote_sell_sends_correct_direction_and_amount(monkeypatch):
+    captured = {}
+
+    async def fake_request(session, method, url, **kwargs):
+        captured.update(kwargs.get("params", {}))
+        return {"outAmount": "999"}
+
+    monkeypatch.setattr(trade_execution, "_request_with_retries", fake_request)
+
+    asyncio.run(trade_execution.get_quote_sell(MINT, 2.5, decimals=6))
+
+    assert captured["inputMint"] == MINT
+    assert captured["outputMint"] == trade_execution.SOL_MINT
+    assert captured["amount"] == 2_500_000  # 2.5 tokens * 10**6, not 10**9
+
+
+def test_get_quote_sell_wrong_decimals_produce_order_of_magnitude_error(monkeypatch):
+    """
+    The highest-consequence bug class per the plan, tested directly: the
+    SAME 2.5-token sell, quoted with the CORRECT decimals (6, matching most
+    memecoins/USDC-style mints) versus an assumed-SOL decimals (9, wrong for
+    almost every SPL token) sends an amount 1000x too large to Jupiter -
+    a real swap attempting to sell 1000x more of the token than actually
+    held, or than intended.
+    """
+    sent_amounts = {}
+
+    async def fake_request(session, method, url, **kwargs):
+        sent_amounts["last"] = kwargs.get("params", {})["amount"]
+        return {"outAmount": "999"}
+
+    monkeypatch.setattr(trade_execution, "_request_with_retries", fake_request)
+
+    asyncio.run(trade_execution.get_quote_sell(MINT, 2.5, decimals=6))
+    correct_amount = sent_amounts["last"]
+
+    asyncio.run(trade_execution.get_quote_sell(MINT, 2.5, decimals=9))  # WRONG - assumed SOL's decimals
+    wrong_amount = sent_amounts["last"]
+
+    assert correct_amount == 2_500_000
+    assert wrong_amount == 2_500_000_000
+    assert wrong_amount / correct_amount == 1000, \
+        "a 3-decimal-place mismatch must produce exactly a 1000x sizing error"
+
+
+def test_get_quote_sell_defaults_slippage_from_config(monkeypatch):
+    captured = {}
+
+    async def fake_request(session, method, url, **kwargs):
+        captured.update(kwargs.get("params", {}))
+        return {"outAmount": "999"}
+
+    monkeypatch.setattr(trade_execution, "_request_with_retries", fake_request)
+    monkeypatch.setattr(config, "SLIPPAGE_BPS", 1234)
+
+    asyncio.run(trade_execution.get_quote_sell(MINT, 1.0, decimals=6))
+
+    assert captured["slippageBps"] == 1234

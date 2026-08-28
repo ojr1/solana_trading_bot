@@ -179,6 +179,94 @@ async def get_quote(output_mint: str, amount_sol: float, slippage_bps: int = Non
         )
 
 
+# ==========================================================================
+# SELL-DIRECTION QUOTE (Stage 10 Part 5, 30 Aug 2026)
+#
+# LIVE_EXECUTION_PLAN.md Gap 7: get_quote() above is hardcoded SOL->token -
+# every quote/swap function in this file until now assumed SOL is always
+# the input. Selling requires the opposite direction (token->SOL), which
+# did not exist anywhere in this codebase. NOT wired into execute_swap() or
+# runner.py - standalone, for a later stage to integrate once proven.
+#
+# get_quote() itself is left completely untouched here (not refactored to
+# share code with get_quote_sell()) - it is already relied on by
+# execute_swap() and its own tests; the marginal duplication below is a
+# smaller risk than touching an already-trusted, already-tested function
+# for this stage's sake.
+# ==========================================================================
+
+
+async def get_token_decimals(mint: str) -> int:
+    """
+    Fetches a mint's decimals via Helius's getTokenSupply - a read-only RPC
+    call that returns decimals directly, without needing to fetch and
+    manually parse the raw mint account's byte layout.
+
+    This exists because get_quote_sell() below must convert a token amount
+    from UI units (e.g. "2.5 tokens") into the raw integer units Jupiter's
+    API expects, and doing that with the WRONG decimals is the highest-
+    consequence bug class flagged in LIVE_EXECUTION_PLAN.md: it produces an
+    amount wrong by one or more orders of magnitude in a REAL swap. Callers
+    must fetch decimals here (or from a transaction's own uiTokenAmount,
+    per parse_fill_from_transaction()) - never hardcode a value copied from
+    a different mint, and never assume every token uses the same decimals
+    SOL or USDC happen to use.
+    """
+    payload = {
+        "jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint],
+    }
+    async with aiohttp.ClientSession() as session:
+        data = await _request_with_retries(
+            session, "post", config.HELIUS_RPC_URL, json=payload,
+        )
+
+    result = data.get("result")
+    if result is None or "value" not in result:
+        raise RuntimeError(f"getTokenSupply returned no result for mint {mint}: {data}")
+
+    return result["value"]["decimals"]
+
+
+async def get_quote_sell(input_mint: str, amount_tokens: float, decimals: int,
+                         slippage_bps: int = None) -> dict:
+    """
+    Asks Jupiter for a swap quote: input_mint -> SOL (the sell direction) -
+    the mirror image of get_quote() above, which is SOL -> output_mint only.
+
+    input_mint: the mint being sold (e.g. a meme coin contract address).
+    amount_tokens: how much to sell, in NATIVE UI units (e.g. 2.5 tokens) -
+        NOT raw integer units. Converted to raw units here using decimals.
+    decimals: the mint's decimals - MUST be fetched (get_token_decimals()
+        above, or read from a real transaction's uiTokenAmount.decimals -
+        see parse_fill_from_transaction()), never hardcoded, never assumed.
+        A wrong value here is silently wrong, not a crash: it produces a
+        raw amount off by 10**|actual - assumed| - see this function's
+        test coverage for a worked example of exactly how large that error
+        gets.
+    slippage_bps: as get_quote(). Defaults to config.SLIPPAGE_BPS.
+
+    Returns Jupiter's raw quote response, same shape as get_quote(). Read-
+    only: no funds move, nothing is signed.
+    """
+    if slippage_bps is None:
+        slippage_bps = config.SLIPPAGE_BPS
+
+    amount_native = int(round(amount_tokens * (10 ** decimals)))
+
+    params = {
+        "inputMint": input_mint,
+        "outputMint": SOL_MINT,
+        "amount": amount_native,
+        "slippageBps": slippage_bps,
+    }
+
+    async with aiohttp.ClientSession() as session:
+        return await _request_with_retries(
+            session, "get", JUPITER_QUOTE_URL,
+            params=params, headers=_jupiter_headers(),
+        )
+
+
 async def build_signed_transaction(quote: dict, priority_fee_lamports: int = None):
     """
     Gets the unsigned swap transaction from Jupiter and signs it locally.
