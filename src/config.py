@@ -94,6 +94,17 @@ def _as_bool(name, raw):
 
 
 # ---------------------------------------------------------------------------
+# DRY_RUN - loaded first (Stage 5, 28 Aug 2026)
+#
+# Whether WALLET_PRIVATE_KEY is required below depends on this value, so it
+# has to be known before that check runs. Moved up from "Trading safety"
+# rather than adding an if in place, so the dependency is obvious from the
+# file's order rather than hidden inside a later block.
+# ---------------------------------------------------------------------------
+
+DRY_RUN = _as_bool("DRY_RUN", _require("DRY_RUN"))
+
+# ---------------------------------------------------------------------------
 # Telegram
 # ---------------------------------------------------------------------------
 
@@ -107,9 +118,19 @@ TELEGRAM_CHANNEL = _require("TELEGRAM_CHANNEL")
 # SENSITIVE: WALLET_PRIVATE_KEY is read here as a plain string and never
 # logged, printed or included in log_resolved_config() except masked. It is
 # handed to wallet.py, which is the only place it is turned into a Keypair.
+#
+# STAGE 5 (28 Aug 2026): required only when DRY_RUN is false. A dry run has
+# no real balance to protect and no transaction to sign, so a private key
+# serves no purpose there - wallet.py constructs its Keypair lazily, on
+# first use, and runner.check_reserve_ok() handles the no-wallet case
+# explicitly rather than assuming a key exists. When DRY_RUN is false this
+# still fails exactly as before: loudly, at startup, same message.
 # ---------------------------------------------------------------------------
 
-WALLET_PRIVATE_KEY = _require("WALLET_PRIVATE_KEY")
+if DRY_RUN:
+    WALLET_PRIVATE_KEY = _optional("WALLET_PRIVATE_KEY")
+else:
+    WALLET_PRIVATE_KEY = _require("WALLET_PRIVATE_KEY")
 
 HELIUS_RPC_URL = _require("HELIUS_RPC_URL")
 if not HELIUS_RPC_URL.startswith("http"):
@@ -125,9 +146,10 @@ JUPITER_API_KEY = _optional("JUPITER_API_KEY")
 
 # ---------------------------------------------------------------------------
 # Trading safety
+#
+# DRY_RUN itself is loaded earlier in this file (see above) - required
+# before WALLET_PRIVATE_KEY's conditional requirement can be evaluated.
 # ---------------------------------------------------------------------------
-
-DRY_RUN = _as_bool("DRY_RUN", _require("DRY_RUN"))
 
 # Total SOL committed to one coin across ALL DCA tranches combined, not one
 # tranche. See runner.py's use of this for the aggregate-position-size cap.
@@ -219,7 +241,11 @@ def log_resolved_config():
     log.info("config: TELEGRAM_API_HASH=%s", _mask(TELEGRAM_API_HASH))
     log.info("config: TELEGRAM_CHANNEL=%s", TELEGRAM_CHANNEL)
     # SENSITIVE: masked, never logged in full.
-    log.info("config: WALLET_PRIVATE_KEY=%s", _mask(WALLET_PRIVATE_KEY))
+    log.info(
+        "config: WALLET_PRIVATE_KEY=%s",
+        _mask(WALLET_PRIVATE_KEY) if WALLET_PRIVATE_KEY
+        else "(not set - dry run only)",
+    )
     log.info("config: HELIUS_RPC_URL=%s", _mask(HELIUS_RPC_URL))
     log.info(
         "config: JUPITER_API_KEY=%s",

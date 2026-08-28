@@ -10,6 +10,14 @@ timeout and bounded retries with backoff, matching trade_execution.py -
 previously this was the one Helius call in the codebase with no timeout at
 all, and it is now called on every buy via runner.py's reserve check, not
 just when this module is run standalone.
+
+STAGE 5 (28 Aug 2026): the Keypair is now built lazily, on first use,
+rather than at import time. Importing wallet.py no longer requires
+WALLET_PRIVATE_KEY at all - config.py only allows it to be unset while
+DRY_RUN is true, and get_keypair()/get_public_key()/get_balance() all
+raise NoWalletConfiguredError if something calls into them anyway with no
+key set. runner.check_reserve_ok() is the one call site that expects and
+handles that error.
 """
 
 import asyncio
@@ -28,16 +36,49 @@ REQUEST_TIMEOUT_SECONDS = 10
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE_SECONDS = 1.0
 
-# Loaded once when this module is imported elsewhere in the bot.
-# SENSITIVE - config.WALLET_PRIVATE_KEY is consumed here and only here to
-# build the Keypair; nothing downstream needs the raw key again.
-keypair = Keypair.from_base58_string(config.WALLET_PRIVATE_KEY)
-public_key = keypair.pubkey()
+# Cache for the lazily-built Keypair - see _load_keypair(). Never accessed
+# directly outside this module; use get_keypair()/get_public_key().
+_keypair = None
+
+
+class NoWalletConfiguredError(RuntimeError):
+    """
+    No WALLET_PRIVATE_KEY is set in .env. Only valid while DRY_RUN is true -
+    config.py requires the key unconditionally otherwise, so reaching this
+    with DRY_RUN false would mean config.py itself has a bug, not that this
+    is a normal condition to handle further up.
+    """
+
+
+def _load_keypair() -> Keypair:
+    """
+    Builds and caches the Keypair from config.WALLET_PRIVATE_KEY on first
+    use. SENSITIVE - the only place the raw private key is turned into a
+    signing object; nothing downstream needs the raw key again.
+
+    Raises NoWalletConfiguredError if no key is set, rather than letting
+    Keypair.from_base58_string(None) fail with an unrelated, confusing
+    TypeError.
+    """
+    global _keypair
+    if _keypair is None:
+        if not config.WALLET_PRIVATE_KEY:
+            raise NoWalletConfiguredError(
+                "No wallet is configured (WALLET_PRIVATE_KEY is not set in "
+                ".env). This is only ever valid while DRY_RUN is true."
+            )
+        _keypair = Keypair.from_base58_string(config.WALLET_PRIVATE_KEY)
+    return _keypair
 
 
 def get_keypair() -> Keypair:
     """Returns the loaded Keypair, used later to sign transactions."""
-    return keypair
+    return _load_keypair()
+
+
+def get_public_key():
+    """Returns the wallet's public key, building the Keypair on first use."""
+    return _load_keypair().pubkey()
 
 
 async def get_balance() -> float:
@@ -46,7 +87,14 @@ async def get_balance() -> float:
     [RPC = Remote Procedure Call — the API a bot uses to talk to the blockchain]
     Returns the balance in SOL (Helius returns lamports; 1 SOL = 1,000,000,000 lamports,
     lamports being the smallest unit — like pence to pounds).
+
+    Raises NoWalletConfiguredError if no wallet is set up at all (see
+    _load_keypair()), or RuntimeError if the RPC call itself fails after
+    retries. Callers that want to tell these apart - see
+    runner.check_reserve_ok() - must catch NoWalletConfiguredError first,
+    since it is a RuntimeError subclass.
     """
+    public_key = get_public_key()
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -81,7 +129,7 @@ async def get_balance() -> float:
 
 async def main():
     balance = await get_balance()
-    print(f"Wallet address: {public_key}")
+    print(f"Wallet address: {get_public_key()}")
     print(f"Balance: {balance:.4f} SOL")
 
 

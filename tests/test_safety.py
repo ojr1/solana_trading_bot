@@ -21,6 +21,7 @@ tests/test_reject_paths.py's isolated_state().
 """
 
 import asyncio
+import importlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -37,6 +38,7 @@ import config          # noqa: E402
 import data_logger     # noqa: E402
 import runner          # noqa: E402
 import trade_execution  # noqa: E402
+import wallet           # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -407,3 +409,112 @@ def test_no_lot_below_min_lot_sol(monkeypatch):
         lot = entry_logic.pcr_to_lot_size(pcr)
         assert lot >= config.MIN_LOT_SOL - 1e-9, f"pcr={pcr} produced lot={lot}"
         assert lot <= config.MAX_LOT_SOL + 1e-9, f"pcr={pcr} produced lot={lot}"
+
+
+# ---------------------------------------------------------------------------
+# STAGE 5 - LAZY WALLET (dry run without a private key),
+# brief_stage5_lazy_wallet.md Step 3
+#
+# The first two tests reload config.py against a mutated environment to
+# observe its real startup behaviour, rather than mocking config.py's own
+# logic - that is the actual thing being tested. config.py is a module
+# already imported (and cached) by runner.py, wallet.py, trade_execution.py
+# and entry_logic.py, so a stray reload leaking a fake DRY_RUN/
+# WALLET_PRIVATE_KEY into later tests would be a real hazard. config_env
+# guards against that - but note the ordering: pytest tears fixtures down
+# LIFO (reverse of setup order), so as a fixture that DEPENDS on
+# monkeypatch, config_env's own post-yield code runs BEFORE monkeypatch's
+# built-in finalizer restores the environment, not after. Reloading
+# config.py at that point would still see the mutated (test) environment,
+# not the real one - the opposite of the intended effect. config_env calls
+# monkeypatch.undo() itself, explicitly, before reloading, rather than
+# relying on teardown order to get this right.
+#
+# SECURITY NOTE, learned the hard way while writing this: simulating "the
+# key is absent" with monkeypatch.delenv() is NOT safe here. config.py
+# calls load_dotenv() on every reload, and python-dotenv defaults to
+# override=False - it only skips a variable that is already PRESENT in
+# os.environ. Deleting it makes it absent again, so the reload promptly
+# re-reads the REAL key straight off disk and repopulates it, which then
+# printed the actual private key in plaintext into a failed assertion's
+# output during development of this exact test. Setting it to an EMPTY
+# STRING instead keeps the name present-but-blank in os.environ, which
+# load_dotenv() will not override, and which config.py's own
+# _require()/_optional() already treat as "missing" - so it behaves
+# identically for what's being tested, without ever touching the real
+# value. Do not change this back to delenv().
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def config_env(monkeypatch):
+    yield monkeypatch
+    monkeypatch.undo()  # restore the real env vars BEFORE reloading against them
+    importlib.reload(config)
+
+
+def test_config_loads_with_dry_run_true_and_no_wallet_key(config_env):
+    config_env.setenv("WALLET_PRIVATE_KEY", "")  # not delenv() - see note above
+    config_env.setenv("DRY_RUN", "true")
+
+    importlib.reload(config)
+
+    assert config.DRY_RUN is True
+    assert config.WALLET_PRIVATE_KEY is None
+
+
+def test_config_raises_when_dry_run_false_and_no_wallet_key(config_env):
+    config_env.setenv("WALLET_PRIVATE_KEY", "")  # not delenv() - see note above
+    config_env.setenv("DRY_RUN", "false")
+
+    # Not pytest.raises(config.ConfigError, ...): that expression captures
+    # today's ConfigError class BEFORE the reload runs, but the reload
+    # re-executes "class ConfigError(Exception): ..." and so raises using
+    # a freshly-created class object of the same name - a different class
+    # by identity, which pytest.raises would then fail to match. Checking
+    # the exception's type NAME (a plain string, stable across reloads)
+    # sidesteps that entirely.
+    try:
+        importlib.reload(config)
+    except Exception as exc:
+        assert type(exc).__name__ == "ConfigError", \
+            f"expected ConfigError, got {type(exc).__name__}: {exc}"
+        assert "WALLET_PRIVATE_KEY" in str(exc)
+    else:
+        pytest.fail(
+            "expected config.py to raise ConfigError when DRY_RUN is false "
+            "and WALLET_PRIVATE_KEY is absent"
+        )
+
+
+def test_importing_wallet_does_not_construct_a_keypair():
+    """
+    A fresh import (simulated here with reload, since wallet.py is already
+    imported) must not build a Keypair - only get_keypair()/get_public_key()/
+    get_balance() do, on first use. This holds regardless of whether a real
+    key is configured (it is, in this repo's real .env); the point is that
+    import alone never touches it.
+    """
+    importlib.reload(wallet)
+    assert wallet._keypair is None
+
+
+def test_reserve_check_allows_entry_when_no_wallet_configured(
+    isolated_positions, monkeypatch, caplog,
+):
+    async def raise_no_wallet():
+        raise wallet.NoWalletConfiguredError("no key set - test")
+    monkeypatch.setattr(runner.wallet, "get_balance", raise_no_wallet)
+
+    with caplog.at_level("WARNING", logger="runner"):
+        result = asyncio.run(runner.check_reserve_ok(0.1))
+
+    assert result is True, \
+        "with no wallet configured in dry run, the entry must be allowed"
+    assert any(
+        record.levelname == "WARNING" and "RESERVE CHECK UNAVAILABLE" in record.message
+        for record in caplog.records
+    ), "the log must name explicitly that no check was actually performed"
+    # And must NOT read as though a check passed - "RESERVE BLOCK" is the
+    # marker used when a check ran and failed; it must not appear here.
+    assert not any("RESERVE BLOCK" in record.message for record in caplog.records)

@@ -46,7 +46,14 @@ from solders.transaction import VersionedTransaction
 from solders import message as solders_message
 
 import config
-from wallet import get_keypair, public_key as wallet_public_key
+import wallet
+# STAGE 5 (28 Aug 2026): wallet.get_keypair()/get_public_key() are called at
+# point of use inside build_signed_transaction() below, not imported by name
+# here. wallet.py's Keypair is now built lazily on first use rather than at
+# import time, so binding wallet.public_key directly at this file's own
+# import time (the previous form: "from wallet import ... public_key as
+# wallet_public_key") would fail - that name no longer exists as a plain
+# module attribute the moment this file is imported.
 
 log = logging.getLogger("trade_execution")
 
@@ -160,7 +167,7 @@ async def build_signed_transaction(quote: dict, priority_fee_lamports: int = Non
 
     payload = {
         "quoteResponse": quote,
-        "userPublicKey": str(wallet_public_key),
+        "userPublicKey": str(wallet.get_public_key()),
         "wrapAndUnwrapSol": True,  # auto-converts SOL <-> WSOL, since SOL itself isn't an SPL token
         "prioritizationFeeLamports": priority_fee_lamports,
     }
@@ -174,7 +181,7 @@ async def build_signed_transaction(quote: dict, priority_fee_lamports: int = Non
     unsigned_tx_b64 = data["swapTransaction"]
     raw_tx = VersionedTransaction.from_bytes(base64.b64decode(unsigned_tx_b64))
 
-    keypair = get_keypair()
+    keypair = wallet.get_keypair()
     signature = keypair.sign_message(solders_message.to_bytes_versioned(raw_tx.message))
     signed_tx = VersionedTransaction.populate(raw_tx.message, [signature])
 

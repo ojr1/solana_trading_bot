@@ -14,12 +14,14 @@ below is simulated at the market cap observed at that moment. DRY_RUN exists
 as a switch so that live execution can be added later without restructuring,
 but it is not yet wired to anything that could spend.
 
-SENSITIVE (added 27 Aug 2026, Stage 1 safety): this file now imports wallet.py
-for the reserve check in check_reserve_ok(), which means wallet.py's module
-level `Keypair.from_base58_string(WALLET_PRIVATE_KEY)` now runs on every
-runner.py startup - the private key IS parsed into memory as a side effect of
-importing wallet, purely to derive the public key that get_balance() reads
-from Helius. Nothing in this file ever calls anything that signs with it.
+SENSITIVE (added 27 Aug 2026, Stage 1 safety): this file imports wallet.py
+for the reserve check in check_reserve_ok(), purely to derive the public key
+that get_balance() reads from Helius. Nothing in this file ever calls
+anything that signs with it. UPDATED 28 Aug 2026 (Stage 5): wallet.py's
+Keypair is now built lazily, on first use, not at import time - so while
+DRY_RUN is true and no wallet is configured, importing wallet here does NOT
+require or parse a private key at all. check_reserve_ok() handles that case
+explicitly; see its docstring.
 
 Two things run at once: the Telegram listener, which reacts to messages as
 they arrive, and the position monitor, which polls on a timer. Python's
@@ -365,9 +367,27 @@ async def check_reserve_ok(trade_size_sol):
     bot or letting it through unchecked - an unknown balance is treated the
     same as an insufficient one, consistent with 2b: never assume, infer, or
     proceed on missing information.
+
+    STAGE 5 (28 Aug 2026): while DRY_RUN is true, no wallet may be
+    configured at all - config.py only allows that while DRY_RUN is true,
+    and this is expected to be a TEMPORARY state, until the wallet is
+    funded for real trading. With no wallet there is no balance to read, so
+    the reserve check cannot run at all - not "fails closed" (there is
+    nothing to check), and never logged as though a check passed. It logs a
+    loud WARNING naming that explicitly and allows the entry through. This
+    path must never be reachable when DRY_RUN is false: config.py already
+    guarantees WALLET_PRIVATE_KEY is present in that case, so
+    wallet.NoWalletConfiguredError should never surface here outside dry run.
     """
     try:
         balance = await wallet.get_balance()
+    except wallet.NoWalletConfiguredError:
+        log.warning(
+            "RESERVE CHECK UNAVAILABLE - no wallet is configured (dry run "
+            "only, temporary until the wallet is funded). Allowing entry "
+            "WITHOUT a reserve check, not because one passed.",
+        )
+        return True
     except RuntimeError as exc:
         log.warning(
             "RESERVE BLOCK could not fetch wallet balance, refusing to buy "
