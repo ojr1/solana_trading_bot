@@ -62,6 +62,7 @@ def isolated_positions(monkeypatch, tmp_path):
     monkeypatch.setattr(data_logger, "CALLS_FILE", tmp_path / "calls.jsonl")
     monkeypatch.setattr(data_logger, "FILLS_FILE", tmp_path / "fills.jsonl")
     monkeypatch.setattr(data_logger, "SNAPSHOTS_FILE", tmp_path / "snapshots.jsonl")
+    monkeypatch.setattr(data_logger, "PRICE_HISTORY_FILE", tmp_path / "price_history.jsonl")
     monkeypatch.setattr(runner.trading_window, "window_status",
                         lambda *a, **k: (True, "test - always open"))
     return fresh, tmp_path / "calls.jsonl"
@@ -518,3 +519,168 @@ def test_reserve_check_allows_entry_when_no_wallet_configured(
     # And must NOT read as though a check passed - "RESERVE BLOCK" is the
     # marker used when a check ran and failed; it must not appear here.
     assert not any("RESERVE BLOCK" in record.message for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# STAGE 7 - PRICE HISTORY LOGGING, brief_stage7_price_history.md Step 2
+#
+# _monitor_once() is exercised directly (not on_message()) since that is the
+# actual call site data_logger.log_price_point() was added to. market_data
+# .fetch_market_caps() is mocked to a fixed mc for every contract in one
+# call, matching its real (session, mints) -> {contract: mc} shape; session
+# itself is never touched by the mock, so None stands in for it.
+#
+# Positions are built to sit exactly AT peak with plenty of room above
+# every exit threshold (entry 20,000, peak/current 40,000: trailing stop
+# only fires at peak*0.40=16,000; no ladder step is crossed since 40,000 is
+# below the first $50,000 rung) so check_exit_conditions() never fires and
+# the position stays open across the call - keeping these tests about the
+# price-history write alone, not an incidental exit.
+# ---------------------------------------------------------------------------
+
+
+def _open_position(ticker, contract, initials_taken, peak_mc=40_000, current_mc=40_000):
+    return {
+        "ticker": ticker, "contract_address": contract, "closed": False,
+        "entry_mc": 20_000, "reference_mc": 20_000, "peak_mc": peak_mc,
+        "last_fill_mc": 20_000, "call_mc": 20_000,
+        "sol_invested": 0.2, "realised_sol": 0.0,
+        "total_tokens_bought": 1.0, "tokens_remaining": 1.0, "original_tokens": 1.0,
+        "initials_taken": initials_taken, "initials_mc": 20_000 * 1.95, "pcr": 0.5,
+        "pending_tranches": [], "fills": [
+            {"stage": 1, "sol": 0.2, "mc": 20_000, "at": "2026-01-01T00:00:00+00:00"},
+        ],
+    }, current_mc
+
+
+def _mock_fetch_market_caps(mc_by_contract):
+    async def fake_fetch_market_caps(session, mints):
+        return {m: mc_by_contract[m] for m in mints if m in mc_by_contract}
+    return fake_fetch_market_caps
+
+
+def test_price_history_written_for_each_open_position_each_cycle(
+    isolated_positions, monkeypatch,
+):
+    positions, _ = isolated_positions
+    price_history_path = data_logger.PRICE_HISTORY_FILE
+
+    p1, mc1 = _open_position("ALPHA", "TestAlpha1" + "9" * 33, initials_taken=True)
+    p2, mc2 = _open_position("BETA", "TestBeta1" + "9" * 34, initials_taken=True)
+    positions[p1["contract_address"]] = p1
+    positions[p2["contract_address"]] = p2
+
+    monkeypatch.setattr(runner.market_data, "fetch_market_caps",
+                         _mock_fetch_market_caps({p1["contract_address"]: mc1,
+                                                   p2["contract_address"]: mc2}))
+
+    asyncio.run(runner._monitor_once(session=None))
+
+    records = read_jsonl(price_history_path)
+    assert len(records) == 2, f"expected one row per open position, got {len(records)}"
+    logged_contracts = {r["contract_address"] for r in records}
+    assert logged_contracts == {p1["contract_address"], p2["contract_address"]}
+
+
+def test_price_history_skips_positions_before_initials(isolated_positions, monkeypatch):
+    """The Step 0 scope decision: no trailing stop is active before initials,
+    so a pre-initials cycle is not logged at all - not sampled, skipped."""
+    positions, _ = isolated_positions
+    price_history_path = data_logger.PRICE_HISTORY_FILE
+
+    pre, mc_pre = _open_position("PRE", "TestPreInit1" + "9" * 31, initials_taken=False)
+    post, mc_post = _open_position("POST", "TestPostInit1" + "9" * 30, initials_taken=True)
+    positions[pre["contract_address"]] = pre
+    positions[post["contract_address"]] = post
+
+    monkeypatch.setattr(runner.market_data, "fetch_market_caps",
+                         _mock_fetch_market_caps({pre["contract_address"]: mc_pre,
+                                                   post["contract_address"]: mc_post}))
+
+    asyncio.run(runner._monitor_once(session=None))
+
+    records = read_jsonl(price_history_path)
+    assert len(records) == 1, "only the post-initials position should be logged"
+    assert records[0]["contract_address"] == post["contract_address"]
+
+
+def test_price_history_not_written_when_no_positions_open(isolated_positions, monkeypatch):
+    price_history_path = data_logger.PRICE_HISTORY_FILE
+    fetch_mock = AsyncMock(side_effect=AssertionError(
+        "fetch_market_caps must not be called when there are no open positions"
+    ))
+    monkeypatch.setattr(runner.market_data, "fetch_market_caps", fetch_mock)
+
+    asyncio.run(runner._monitor_once(session=None))
+
+    assert not price_history_path.exists(), \
+        "no price_history.jsonl row (or file) should be produced with nothing open"
+    fetch_mock.assert_not_called()
+
+
+def test_price_history_record_contains_every_specified_field(
+    isolated_positions, monkeypatch,
+):
+    positions, _ = isolated_positions
+    price_history_path = data_logger.PRICE_HISTORY_FILE
+
+    p, mc = _open_position("FIELDS", "TestFields1" + "9" * 32, initials_taken=True,
+                            peak_mc=35_000, current_mc=42_000)  # current_mc > peak_mc
+    positions[p["contract_address"]] = p
+    monkeypatch.setattr(runner.market_data, "fetch_market_caps",
+                         _mock_fetch_market_caps({p["contract_address"]: mc}))
+
+    asyncio.run(runner._monitor_once(session=None))
+
+    records = read_jsonl(price_history_path)
+    assert len(records) == 1
+    record = records[0]
+
+    for field in ("ts", "schema_version", "contract_address", "mc", "peak_mc",
+                  "initials_taken"):
+        assert field in record, f"missing required field: {field}"
+
+    assert record["contract_address"] == p["contract_address"]
+    assert record["mc"] == 42_000
+    assert record["initials_taken"] is True
+    # peak-lag fix: current_mc (42,000) exceeds the position's stored peak_mc
+    # (35,000) as of this cycle - the logged peak must reflect the new high,
+    # not the stale stored value, since exit_logic hasn't updated it yet at
+    # the point log_price_point() is called.
+    assert record["peak_mc"] == 42_000, (
+        "peak_mc must be max(stored peak_mc, current_mc), not the stale stored "
+        "value from before this cycle's exit_logic.check_exit_conditions() runs"
+    )
+
+    # Fields the brief explicitly said to drop from this file specifically.
+    assert "run_id" not in record
+    assert "event" not in record
+    assert "ticker" not in record
+
+
+def test_price_history_write_failure_does_not_propagate(
+    isolated_positions, monkeypatch, caplog,
+):
+    positions, _ = isolated_positions
+    # Point the file at a path whose parent directory cannot exist (a file,
+    # not a directory, in the path) so the write raises OSError/NotADirectoryError.
+    bad_dir = data_logger.DATA_DIR / "not_a_directory"
+    bad_dir.parent.mkdir(parents=True, exist_ok=True)
+    bad_dir.write_text("blocking file, not a directory")
+    monkeypatch.setattr(data_logger, "PRICE_HISTORY_FILE", bad_dir / "price_history.jsonl")
+
+    p, mc = _open_position("FAILWRITE", "TestFailWrite1" + "9" * 29, initials_taken=True)
+    positions[p["contract_address"]] = p
+    monkeypatch.setattr(runner.market_data, "fetch_market_caps",
+                         _mock_fetch_market_caps({p["contract_address"]: mc}))
+
+    with caplog.at_level("WARNING", logger="data_logger"):
+        asyncio.run(runner._monitor_once(session=None))  # must not raise
+
+    assert any(
+        record.levelname == "WARNING" and "could not write" in record.message
+        for record in caplog.records
+    ), "a write failure must be logged as a WARNING, not silently lost or raised"
+    # The rest of the cycle must still have completed - proven by the position
+    # remaining exactly as it was (not closed, unmodified), not by a crash.
+    assert positions[p["contract_address"]]["closed"] is False

@@ -186,8 +186,8 @@ async def scenario_normal_buy():
     if bought:
         check(bought[0].get("dev_mints") == 11.0,
               "calls.jsonl 'bought' record carries the detail fields")
-        check(bought[0].get("schema_version") == 2,
-              "record stamped schema_version 2")
+        check(bought[0].get("schema_version") == data_logger.SCHEMA_VERSION,
+              f"record stamped schema_version {data_logger.SCHEMA_VERSION}")
 
 
 async def scenario_gap_reject():

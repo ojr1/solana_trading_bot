@@ -899,6 +899,8 @@ async def _monitor_once(session):
         if current_mc is None:
             continue
 
+        data_logger.log_price_point(position, current_mc)
+
         fill = await check_dca_fills(position, current_mc)
         if fill:
             changed = True

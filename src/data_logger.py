@@ -8,6 +8,7 @@ object per line, appended, never rewritten.
     data/calls.jsonl        every call the bot saw and what it decided
     data/fills.jsonl        every buy and every sell
     data/snapshots.jsonl    periodic price observations on open positions
+    data/price_history.jsonl  per-cycle price observations, post-initials only
 
 Why JSONL rather than one big JSON file: a JSON file must be complete to be
 readable, so a process killed mid-write corrupts the lot. JSONL appends one
@@ -29,6 +30,20 @@ SCHEMA HISTORY
   v2  (15 Aug 2026)  call records gained the Jupiter detail fields:
                      top_holders_pct, organic_score, dev_migrations,
                      dev_mints, liquidity, launchpad, live_holder_count.
+  v3  (28 Aug 2026)  data/price_history.jsonl added (Stage 7). One row per
+                     open position per monitor cycle, but ONLY once initials
+                     have been taken for that position - before initials, no
+                     trailing stop is active at any drawdown setting, so a
+                     pre-initials price point cannot inform a stepped-stop
+                     comparison and is not worth the extra volume. This is a
+                     deliberate scope decision, not a sampling shortcut: it
+                     means price_history.jsonl can never be used to analyse
+                     entry-side behaviour (e.g. how close a position got to
+                     stop-loss or the absolute floor before ever reaching
+                     initials) - only post-initials exit behaviour. This file
+                     also intentionally omits run_id, event and ticker (kept
+                     on the other three files) - see log_price_point()'s
+                     docstring for why.
 
 Why the version number matters: records written before 15 Aug have no such
 keys at all, and records written after have them but often as null. Analysis
@@ -43,12 +58,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Bump this when a schema changes, so analysis can tell record shapes apart.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DATA_DIR = Path("data")
 CALLS_FILE = DATA_DIR / "calls.jsonl"
 FILLS_FILE = DATA_DIR / "fills.jsonl"
 SNAPSHOTS_FILE = DATA_DIR / "snapshots.jsonl"
+PRICE_HISTORY_FILE = DATA_DIR / "price_history.jsonl"
 
 log = logging.getLogger("data_logger")
 
@@ -243,6 +259,67 @@ def log_snapshot(position, current_mc, value_sol, pnl_sol):
         "pending_tranches": len(position.get("pending_tranches", [])),
     }
     _write(SNAPSHOTS_FILE, record)
+
+
+# ==========================================================================
+# PRICE HISTORY (Stage 7)
+#
+# Dense per-cycle price observations, added specifically to answer whether a
+# stepped trailing stop would beat the current flat one - see
+# EXIT_RULES_ANALYSIS.md. Deliberately narrower than the other three files:
+#
+#   - Post-initials only. Before initials, no trailing stop is active at any
+#     drawdown setting, so a pre-initials row cannot inform that question and
+#     is not logged - a stated scope reduction (see SCHEMA HISTORY v3 above),
+#     not a volume shortcut applied indiscriminately.
+#   - Trimmed record: no run_id (nothing else in this codebase keys off it
+#     for price_history specifically, and every row already carries ts), no
+#     event (this file only ever holds one kind of row), no ticker (derivable
+#     from contract_address via positions.json - kept out to save the ~15
+#     bytes/row it would otherwise cost across a much higher row count than
+#     the other three files).
+#   - Written with its own inline try/except, not the shared _write() helper,
+#     so a lost row here logs at WARNING rather than _write()'s ERROR - this
+#     is a diagnostic for future analysis, not an accounting record; losing
+#     one is a shrug, not an incident.
+# ==========================================================================
+
+
+def log_price_point(position, current_mc):
+    """
+    One row per open position per monitor cycle, once initials have been
+    taken (see module docstring for why not before). Call with the mc value
+    already fetched this cycle - never fetches its own.
+
+    peak_mc is written as max(position['peak_mc'], current_mc) rather than
+    the stored field verbatim: exit_logic.check_exit_conditions() is what
+    actually updates position['peak_mc'], and runner.py calls this before
+    that happens each cycle, so the stored value alone would lag one cycle
+    behind on any row where current_mc is itself a new high.
+
+    Never raises. A failure here must not be able to take down the monitor
+    loop it is diagnosing - it is logged as a WARNING and swallowed.
+    """
+    if not position.get("initials_taken"):
+        return
+
+    record = {
+        "ts": _now(),
+        "schema_version": SCHEMA_VERSION,
+        "contract_address": position.get("contract_address"),
+        "mc": current_mc,
+        "peak_mc": max(position.get("peak_mc", current_mc), current_mc),
+        "initials_taken": position.get("initials_taken"),
+    }
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+        with open(PRICE_HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except OSError as exc:
+        log.warning("data_logger could not write to %s: %s",
+                    PRICE_HISTORY_FILE.name, exc)
+    except (TypeError, ValueError) as exc:
+        log.warning("data_logger could not serialise a price_history record: %s", exc)
 
 
 # ==========================================================================
