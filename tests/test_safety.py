@@ -48,6 +48,21 @@ import wallet           # noqa: E402
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _clear_decimals_cache():
+    """
+    trade_execution._decimals_cache (Stage 12) is module-global mutable
+    state - without this, a decimals lookup cached by one test could leak
+    into another test using the same mint constant and silently skip a
+    mock a later test expected to be called. Autouse so every test in this
+    file starts and ends with an empty cache, whether or not it touches
+    decimals at all (clearing an unrelated empty dict is free).
+    """
+    trade_execution._decimals_cache.clear()
+    yield
+    trade_execution._decimals_cache.clear()
+
+
 @pytest.fixture
 def isolated_positions(monkeypatch, tmp_path):
     """
@@ -1675,3 +1690,211 @@ def test_parse_fill_real_transaction_owner_not_fee_payer(monkeypatch):
     assert parsed["real_token_delta"] == pytest.approx(-32_210_317.277051)  # SELL
     assert parsed["real_sol_delta"] == pytest.approx(1.3)
     assert parsed["fee_sol"] == pytest.approx(0.001005)  # reported, but NOT this owner's cost
+
+
+# ---------------------------------------------------------------------------
+# STAGE 12 - execute_swap() generalised for direction (sell path), decimals
+# caching, brief_stage12_wire_sell.md. NOT wired into runner.py (unchanged -
+# confirmed by the diff, not by these tests). No transaction signed or
+# submitted anywhere in this section - build_signed_transaction/
+# submit_transaction are mocked exactly as the existing buy-side tests mock
+# them.
+# ---------------------------------------------------------------------------
+
+
+def test_execute_swap_sell_dry_run_never_reaches_submission(monkeypatch):
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    monkeypatch.setattr(trade_execution, "get_quote_sell",
+                        AsyncMock(return_value={"outAmount": "12345"}))
+    build_mock = AsyncMock(
+        side_effect=AssertionError("build_signed_transaction must not be called in DRY_RUN")
+    )
+    submit_mock = AsyncMock(
+        side_effect=AssertionError("submit_transaction must not be called in DRY_RUN")
+    )
+    monkeypatch.setattr(trade_execution, "build_signed_transaction", build_mock)
+    monkeypatch.setattr(trade_execution, "submit_transaction", submit_mock)
+
+    result = asyncio.run(trade_execution.execute_swap(
+        MINT, 2.5, direction="sell", decimals=6,
+    ))
+
+    assert result["dry_run"] is True
+    assert result["confirmed"] is False
+    assert result["signature"] is None
+    assert result["direction"] == "sell"
+    build_mock.assert_not_called()
+    submit_mock.assert_not_called()
+
+
+def test_execute_swap_sell_successful_chains_into_parse_fill(monkeypatch):
+    """Proves the pieces fit together end to end (Part 4): a successful
+    sell's signature is exactly what a subsequent parse_fill_from_transaction()
+    call would use - both mocked, nothing real, but the SAME code paths a
+    live sell would exercise are chained here."""
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(trade_execution, "get_quote_sell",
+                        AsyncMock(return_value={"outAmount": "50000000"}))
+    monkeypatch.setattr(trade_execution, "build_signed_transaction",
+                        AsyncMock(return_value=(b"fake-signed-tx", "fake-local-sig")))
+    monkeypatch.setattr(trade_execution, "submit_transaction",
+                        AsyncMock(return_value="fake-sell-signature"))
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="confirmed"))
+
+    result = asyncio.run(trade_execution.execute_swap(
+        MINT, 2.5, direction="sell", decimals=6,
+    ))
+
+    assert result["confirmed"] is True
+    assert result["direction"] == "sell"
+    assert result["signature"] == "fake-sell-signature"
+
+    # Chain into parse_fill_from_transaction() using the signature execute_swap()
+    # just returned - mocked, but proves the handoff shape is compatible.
+    mock_parsed = {"real_token_delta": -2.5, "real_sol_delta": 0.048, "fee_sol": 0.000005, "decimals": 6}
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value={"dummy": True}))
+    parse_mock = AsyncMock(return_value=mock_parsed)
+    monkeypatch.setattr(trade_execution, "parse_fill_from_transaction", parse_mock)
+
+    parsed = asyncio.run(trade_execution.parse_fill_from_transaction(
+        result["signature"], MINT,
+    ))
+    parse_mock.assert_awaited_once_with(result["signature"], MINT)
+    assert parsed["real_token_delta"] == -2.5
+
+
+def test_execute_swap_sell_reverted_raises_transaction_reverted(monkeypatch):
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(trade_execution, "get_quote_sell",
+                        AsyncMock(return_value={"outAmount": "12345"}))
+    monkeypatch.setattr(trade_execution, "build_signed_transaction",
+                        AsyncMock(return_value=(b"fake-signed-tx", "fake-local-sig")))
+    monkeypatch.setattr(trade_execution, "submit_transaction",
+                        AsyncMock(return_value="fake-signature"))
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="failed"))
+
+    with pytest.raises(trade_execution.TransactionRevertedError):
+        asyncio.run(trade_execution.execute_swap(MINT, 2.5, direction="sell", decimals=6))
+
+
+def test_execute_swap_sell_timeout_raises_fill_not_confirmed(monkeypatch):
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(trade_execution, "get_quote_sell",
+                        AsyncMock(return_value={"outAmount": "12345"}))
+    monkeypatch.setattr(trade_execution, "build_signed_transaction",
+                        AsyncMock(return_value=(b"fake-signed-tx", "fake-local-sig")))
+    monkeypatch.setattr(trade_execution, "submit_transaction",
+                        AsyncMock(return_value="fake-signature"))
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="timeout"))
+
+    with pytest.raises(trade_execution.FillNotConfirmedError):
+        asyncio.run(trade_execution.execute_swap(MINT, 2.5, direction="sell", decimals=6))
+
+
+def test_execute_swap_sell_submission_failure_carries_local_signature(monkeypatch):
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(trade_execution, "get_quote_sell",
+                        AsyncMock(return_value={"outAmount": "12345"}))
+    monkeypatch.setattr(trade_execution, "build_signed_transaction",
+                        AsyncMock(return_value=(b"fake-signed-tx", "sell-local-sig-777")))
+    monkeypatch.setattr(trade_execution, "submit_transaction",
+                        AsyncMock(side_effect=RuntimeError("network drop")))
+
+    with pytest.raises(trade_execution.TransactionSubmissionError) as excinfo:
+        asyncio.run(trade_execution.execute_swap(MINT, 2.5, direction="sell", decimals=6))
+
+    assert excinfo.value.local_signature == "sell-local-sig-777"
+
+
+def test_execute_swap_sell_decimals_lookup_failure_aborts_before_any_quote(monkeypatch, caplog):
+    """The conservative option (flagged for review): a sell whose decimals
+    cannot be resolved is abandoned, never attempted with a guessed value -
+    and never even reaches get_quote_sell()."""
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(trade_execution, "get_token_decimals",
+                        AsyncMock(side_effect=trade_execution.DecimalsLookupError("RPC down")))
+    quote_mock = AsyncMock(side_effect=AssertionError("get_quote_sell must not be called"))
+    monkeypatch.setattr(trade_execution, "get_quote_sell", quote_mock)
+
+    with caplog.at_level("ERROR", logger="trade_execution"):
+        with pytest.raises(trade_execution.DecimalsLookupError):
+            asyncio.run(trade_execution.execute_swap(MINT, 2.5, direction="sell"))  # no decimals supplied
+
+    quote_mock.assert_not_called()
+    assert any("SELL ABORTED" in r.message for r in caplog.records)
+
+
+def test_execute_swap_sell_quote_failure_raises_before_any_signing(monkeypatch):
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(trade_execution, "get_quote_sell",
+                        AsyncMock(return_value={"error": "no route found"}))  # no outAmount
+    build_mock = AsyncMock(side_effect=AssertionError("must not sign on a failed quote"))
+    monkeypatch.setattr(trade_execution, "build_signed_transaction", build_mock)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(trade_execution.execute_swap(MINT, 2.5, direction="sell", decimals=6))
+
+    build_mock.assert_not_called()
+
+
+def test_execute_swap_sell_uses_supplied_decimals_without_lookup(monkeypatch):
+    """If the caller already knows decimals (e.g. from a recent
+    parse_fill_from_transaction() on the same mint), execute_swap() must not
+    pay for a network lookup it doesn't need."""
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    decimals_mock = AsyncMock(side_effect=AssertionError("get_token_decimals must not be called"))
+    monkeypatch.setattr(trade_execution, "get_token_decimals", decimals_mock)
+    monkeypatch.setattr(trade_execution, "get_quote_sell",
+                        AsyncMock(return_value={"outAmount": "999"}))
+
+    asyncio.run(trade_execution.execute_swap(MINT, 2.5, direction="sell", decimals=6))
+
+    decimals_mock.assert_not_called()
+
+
+def test_execute_swap_invalid_direction_raises_value_error():
+    with pytest.raises(ValueError):
+        asyncio.run(trade_execution.execute_swap(MINT, 1.0, direction="sideways"))
+
+
+def test_execute_swap_buy_direction_unchanged_and_labelled(monkeypatch):
+    """Regression: the pre-Stage-12 buy path, called the old way
+    (positional mint/amount, default direction), still behaves identically
+    and now also reports direction="buy" in the result."""
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    monkeypatch.setattr(trade_execution, "get_quote",
+                        AsyncMock(return_value={"outAmount": "99999"}))
+
+    result = asyncio.run(trade_execution.execute_swap(MINT, 0.05))
+
+    assert result["dry_run"] is True
+    assert result["direction"] == "buy"
+
+
+def test_get_token_decimals_cache_avoids_second_network_call(monkeypatch):
+    call_count = {"n": 0}
+
+    async def fake_request(session, method, url, **kwargs):
+        call_count["n"] += 1
+        return {"result": {"value": {"decimals": 6}}}
+
+    monkeypatch.setattr(trade_execution, "_request_with_retries", fake_request)
+
+    first = asyncio.run(trade_execution.get_token_decimals(MINT))
+    second = asyncio.run(trade_execution.get_token_decimals(MINT))
+
+    assert first == 6 and second == 6
+    assert call_count["n"] == 1, "the second call must be served from cache, not the network"
+
+
+def test_get_token_decimals_network_failure_raises_decimals_lookup_error(monkeypatch):
+    async def fake_request(session, method, url, **kwargs):
+        raise RuntimeError("all retries exhausted")
+
+    monkeypatch.setattr(trade_execution, "_request_with_retries", fake_request)
+
+    with pytest.raises(trade_execution.DecimalsLookupError):
+        asyncio.run(trade_execution.get_token_decimals("TestNeverCachedMint111111111111111111"))

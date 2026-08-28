@@ -35,6 +35,18 @@ STAGE 1 SAFETY (added 27 Aug 2026):
   FillNotConfirmedError instead: an unconfirmed fill is an abandoned trade,
   never assumed to have happened, and a caller cannot accidentally ignore it
   by not checking a field.
+
+STAGE 12 (31 Aug 2026): execute_swap() takes a direction ("buy", the
+default, or "sell") instead of being buy-only. Selling uses
+get_quote_sell() and the cached get_token_decimals() (see
+SELL_PATH_REPORT.md for the caching and decimals-failure decisions, both
+flagged for review); everything after the quote step - DRY_RUN
+short-circuit, local signature capture, submission, the three-way
+confirm() outcome, and all three exception types - is the SAME shared
+pipeline for both directions, unchanged. Still NOT wired into runner.py's
+control path either direction - this stage only makes a sell possible to
+call, the same way execute_swap() has been callable-but-unwired for buys
+since Stage 1.
 """
 
 import asyncio
@@ -196,11 +208,36 @@ async def get_quote(output_mint: str, amount_sol: float, slippage_bps: int = Non
 # ==========================================================================
 
 
+class DecimalsLookupError(RuntimeError):
+    """
+    get_token_decimals() could not resolve a mint's decimals. Raised
+    distinctly (not a bare RuntimeError) so a sell-side caller can
+    recognise this specific failure mode - see execute_swap()'s sell
+    branch, which treats this as a reason to ABANDON the sell attempt
+    rather than guess, per Stage 12 Part 2's decision (flagged for review
+    in SELL_PATH_REPORT.md).
+    """
+
+
+# In-memory only - see SELL_PATH_REPORT.md Part 2 for why this is not
+# persisted to disk. A mint's decimals are a fixed, immutable property of
+# its on-chain mint account (set once at creation, never changed), so a
+# cache entry can never go stale; there is no TTL or invalidation logic
+# because none is needed. Keyed by mint address.
+_decimals_cache = {}
+
+
 async def get_token_decimals(mint: str) -> int:
     """
     Fetches a mint's decimals via Helius's getTokenSupply - a read-only RPC
     call that returns decimals directly, without needing to fetch and
     manually parse the raw mint account's byte layout.
+
+    Cached in-memory (Stage 12 Part 2): a sell may happen under time
+    pressure during a fast-moving exit, and this value never changes for a
+    given mint once fetched, so paying the network round-trip more than
+    once per mint per process is pure waste. Not persisted across
+    restarts - see the module-level _decimals_cache comment for why.
 
     This exists because get_quote_sell() below must convert a token amount
     from UI units (e.g. "2.5 tokens") into the raw integer units Jupiter's
@@ -211,20 +248,39 @@ async def get_token_decimals(mint: str) -> int:
     per parse_fill_from_transaction()) - never hardcode a value copied from
     a different mint, and never assume every token uses the same decimals
     SOL or USDC happen to use.
+
+    Raises DecimalsLookupError (not a bare RuntimeError) on failure, so a
+    sell-side caller can recognise and handle this specific failure mode.
     """
+    if mint in _decimals_cache:
+        return _decimals_cache[mint]
+
     payload = {
         "jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint],
     }
-    async with aiohttp.ClientSession() as session:
-        data = await _request_with_retries(
-            session, "post", config.HELIUS_RPC_URL, json=payload,
-        )
+    try:
+        async with aiohttp.ClientSession() as session:
+            data = await _request_with_retries(
+                session, "post", config.HELIUS_RPC_URL, json=payload,
+            )
+    except RuntimeError as exc:
+        # Normalise _request_with_retries()'s network-exhausted failure into
+        # the same exception type as a bad response, so every caller can
+        # rely on DecimalsLookupError alone rather than also catching a
+        # bare RuntimeError for this one path.
+        raise DecimalsLookupError(
+            f"getTokenSupply network request failed for mint {mint}: {exc}"
+        ) from exc
 
     result = data.get("result")
     if result is None or "value" not in result:
-        raise RuntimeError(f"getTokenSupply returned no result for mint {mint}: {data}")
+        raise DecimalsLookupError(
+            f"getTokenSupply returned no result for mint {mint}: {data}"
+        )
 
-    return result["value"]["decimals"]
+    decimals = result["value"]["decimals"]
+    _decimals_cache[mint] = decimals
+    return decimals
 
 
 async def get_quote_sell(input_mint: str, amount_tokens: float, decimals: int,
@@ -410,46 +466,106 @@ async def confirm_transaction(signature: str, timeout_seconds: int = 60) -> str:
     return "timeout"
 
 
-async def execute_swap(output_mint: str, amount_sol: float,
-                       slippage_bps: int = None, priority_fee_lamports: int = None) -> dict:
+async def execute_swap(mint: str, amount: float, direction: str = "buy",
+                       decimals: int = None, slippage_bps: int = None,
+                       priority_fee_lamports: int = None) -> dict:
     """
     Full pipeline: quote -> (DRY_RUN: log and stop) -> build+sign -> submit -> confirm.
     SENSITIVE — while DRY_RUN is false, calling this with a real mint and
     amount executes a REAL trade.
 
+    Stage 12: generalised for direction. A single function with a
+    direction parameter, rather than a separate execute_swap_sell() -
+    chosen so the shared, already-hardened pipeline below (DRY_RUN
+    short-circuit, local signature capture, submit, the three-way confirm
+    outcome, all three exception types) can never drift between a buy path
+    and a sell path maintained separately. See SELL_PATH_REPORT.md for the
+    full reasoning.
+
+    direction: "buy" (default - unchanged from before Stage 12) means
+        SOL -> mint, and amount is how much SOL to spend. "sell" means
+        mint -> SOL, and amount is how many tokens (native UI units, e.g.
+        2.5) to sell.
+    decimals: SELL ONLY. The mint's decimals, needed to convert `amount`
+        into the raw integer units Jupiter's API expects. If omitted for a
+        sell, fetched via the cached get_token_decimals(mint) - see that
+        function's docstring. Ignored for a buy. A decimals lookup that
+        fails aborts the sell attempt entirely rather than guessing - see
+        below and SELL_PATH_REPORT.md Part 2.
+
     Raises FillNotConfirmedError if the transaction was submitted but never
     confirmed within the timeout - genuinely unknown, may still land later.
     Raises TransactionRevertedError if it confirmed but FAILED on-chain -
     known outcome, no funds moved. Raises TransactionSubmissionError
-    (carrying local_signature) if submission itself failed. The caller must
-    never treat any of these as a successful fill.
+    (carrying local_signature) if submission itself failed. Raises
+    DecimalsLookupError (sell only) if the mint's decimals could not be
+    resolved - never guessed. The caller must never treat any of these as
+    a successful fill.
 
-    Returns the transaction signature and the quote used. Note: this does not
-    yet parse the actual realised fill amount from the confirmed transaction —
-    cross-check the signature on Solscan to see exactly what was received.
+    Returns the transaction signature and the quote used, plus which
+    direction this was. Note: this does not yet parse the actual realised
+    fill amount from the confirmed transaction — pass the signature to
+    parse_fill_from_transaction() (or cross-check on Solscan) to see
+    exactly what was received.
     """
+    if direction not in ("buy", "sell"):
+        raise ValueError(f"direction must be 'buy' or 'sell', got {direction!r}")
+
     if slippage_bps is None:
         slippage_bps = config.SLIPPAGE_BPS
     if priority_fee_lamports is None:
         priority_fee_lamports = config.PRIORITY_FEE_LAMPORTS
 
-    quote = await get_quote(output_mint, amount_sol, slippage_bps)
+    if direction == "sell":
+        if decimals is None:
+            try:
+                decimals = await get_token_decimals(mint)
+            except Exception:
+                # CONSERVATIVE OPTION (Stage 12 Part 2, flagged for review -
+                # see SELL_PATH_REPORT.md): a sell whose decimals cannot be
+                # resolved is ABANDONED, never attempted with a guessed
+                # value. Exits matter more than entries, so this is loud
+                # (ERROR, not a swallowed warning) even though it means
+                # continued market exposure rather than a possibly
+                # order-of-magnitude-wrong swap amount.
+                log.error(
+                    "SELL ABORTED for %s: could not resolve token decimals - "
+                    "refusing to guess and risk an order-of-magnitude sizing "
+                    "error. This sell attempt is abandoned; the position "
+                    "remains open and unsold this cycle.",
+                    mint,
+                )
+                raise
+        quote = await get_quote_sell(mint, amount, decimals, slippage_bps)
+    else:
+        quote = await get_quote(mint, amount, slippage_bps)
+
     if "outAmount" not in quote:
         raise RuntimeError(f"Quote failed, aborting before any signing: {quote}")
 
     if config.DRY_RUN:
-        log.info(
-            "DRY RUN - would submit: %.4f SOL -> %s | slippage %d bps | "
-            "priority fee %d lamports | expected out %s",
-            amount_sol, output_mint, slippage_bps, priority_fee_lamports,
-            quote.get("outAmount"),
-        )
+        if direction == "sell":
+            log.info(
+                "DRY RUN - would submit (SELL): %.6f tokens of %s -> SOL | "
+                "slippage %d bps | priority fee %d lamports | expected out "
+                "%s lamports",
+                amount, mint, slippage_bps, priority_fee_lamports,
+                quote.get("outAmount"),
+            )
+        else:
+            log.info(
+                "DRY RUN - would submit (BUY): %.4f SOL -> %s | slippage %d bps | "
+                "priority fee %d lamports | expected out %s",
+                amount, mint, slippage_bps, priority_fee_lamports,
+                quote.get("outAmount"),
+            )
         return {
             "signature": None,
             "confirmed": False,
             "dry_run": True,
             "quote": quote,
             "solscan_url": None,
+            "direction": direction,
         }
 
     signed_tx_bytes, local_signature = await build_signed_transaction(
@@ -494,6 +610,7 @@ async def execute_swap(output_mint: str, amount_sol: float,
         "dry_run": False,
         "quote": quote,
         "solscan_url": f"https://solscan.io/tx/{signature}",
+        "direction": direction,
     }
 
 
