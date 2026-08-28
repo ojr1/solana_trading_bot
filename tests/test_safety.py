@@ -1278,3 +1278,164 @@ def test_reserve_check_allows_when_in_flight_buys_still_leave_room(
     result = asyncio.run(runner.check_reserve_ok(0.08))
 
     assert result is True
+
+
+# ---------------------------------------------------------------------------
+# STAGE 10 PART 4 - parse_fill_from_transaction(), standalone, not wired in.
+# brief_stage10_autonomous.md. Mocked at _fetch_transaction (one
+# getTransaction call), same pattern as _fetch_signature_status in Part 1 -
+# no real network call, no real signature needed for these tests.
+# ---------------------------------------------------------------------------
+
+WALLET = "TestWalletOwnerPubkey11111111111111111111"
+MINT = "TestMintAddress1111111111111111111111111"
+
+
+def _tx_result(pre_token, post_token, pre_bal, post_bal, account_keys,
+               fee=5000, err=None, loaded_writable=None, loaded_readonly=None):
+    return {
+        "transaction": {"message": {"accountKeys": account_keys}},
+        "meta": {
+            "err": err,
+            "fee": fee,
+            "preBalances": pre_bal,
+            "postBalances": post_bal,
+            "preTokenBalances": pre_token,
+            "postTokenBalances": post_token,
+            "loadedAddresses": {
+                "writable": loaded_writable or [],
+                "readonly": loaded_readonly or [],
+            },
+        },
+    }
+
+
+def _token_entry(owner, mint, amount, decimals):
+    return {
+        "owner": owner, "mint": mint,
+        "uiTokenAmount": {"amount": str(amount), "decimals": decimals,
+                          "uiAmount": amount / (10 ** decimals)},
+    }
+
+
+def test_parse_fill_buy_reports_tokens_received_and_sol_spent(monkeypatch):
+    """A buy: token account created by this tx (absent from
+    preTokenBalances, treated as 0), SOL decreases by spend + fee."""
+    result = _tx_result(
+        pre_token=[],  # ATA did not exist before this tx
+        post_token=[_token_entry(WALLET, MINT, 2_000_000, 6)],  # 2.0 tokens, 6 decimals
+        pre_bal=[1_000_000_000], post_bal=[899_995_000],  # spent 0.1 SOL + 5000 lamport fee
+        account_keys=[WALLET],
+    )
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value=result))
+
+    parsed = asyncio.run(trade_execution.parse_fill_from_transaction(
+        "sig-buy", MINT, owner_pubkey=WALLET,
+    ))
+
+    assert parsed["real_token_delta"] == pytest.approx(2.0)
+    assert parsed["real_sol_delta"] == pytest.approx(-0.100005)
+    assert parsed["fee_sol"] == pytest.approx(0.000005)
+    assert parsed["decimals"] == 6
+
+
+def test_parse_fill_sell_reports_tokens_sent_and_sol_received(monkeypatch):
+    """A sell: token account fully drained (absent from postTokenBalances,
+    treated as 0), SOL increases (received minus fee)."""
+    result = _tx_result(
+        pre_token=[_token_entry(WALLET, MINT, 2_000_000, 6)],
+        post_token=[],  # account closed/emptied by this tx
+        pre_bal=[899_995_000], post_bal=[1_050_000_000],
+        account_keys=[WALLET],
+    )
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value=result))
+
+    parsed = asyncio.run(trade_execution.parse_fill_from_transaction(
+        "sig-sell", MINT, owner_pubkey=WALLET,
+    ))
+
+    assert parsed["real_token_delta"] == pytest.approx(-2.0)
+    assert parsed["real_sol_delta"] == pytest.approx(0.150005)
+
+
+def test_parse_fill_uses_real_decimals_not_a_hardcoded_default(monkeypatch):
+    """The highest-consequence bug class per the brief: decimals must come
+    from the transaction's own data, not an assumption. A 2-decimal mint
+    (unlike SOL's 9 or USDC's 6) proves it isn't hardcoded either way."""
+    result = _tx_result(
+        pre_token=[_token_entry(WALLET, MINT, 500, 2)],   # 5.00 units
+        post_token=[_token_entry(WALLET, MINT, 12345, 2)],  # 123.45 units
+        pre_bal=[1_000_000_000], post_bal=[900_000_000],
+        account_keys=[WALLET],
+    )
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value=result))
+
+    parsed = asyncio.run(trade_execution.parse_fill_from_transaction(
+        "sig-decimals", MINT, owner_pubkey=WALLET,
+    ))
+
+    assert parsed["decimals"] == 2
+    # (12345 - 500) / 100 = 118.45 - if decimals were wrongly assumed to be
+    # 6 or 9, this would be off by four or seven orders of magnitude.
+    assert parsed["real_token_delta"] == pytest.approx(118.45)
+
+
+def test_parse_fill_finds_owner_via_address_lookup_table(monkeypatch):
+    """Versioned (v0) transactions using Jupiter's address lookup tables
+    put extra accounts in meta.loadedAddresses, not the static message
+    accountKeys. Our own wallet landing ONLY in loadedAddresses.writable
+    (as it would for many real swaps) must still resolve correctly - this
+    is exactly the ATA/versioned-tx risk flagged as low-confidence in
+    LIVE_EXECUTION_PLAN.md."""
+    result = _tx_result(
+        pre_token=[],
+        post_token=[_token_entry(WALLET, MINT, 1_000_000, 6)],
+        pre_bal=[2_000_000_000, 500_000_000],   # index 0 = some other account
+        post_bal=[2_000_000_000, 499_950_000],  # index 1 = our wallet, via ALT
+        account_keys=["SomeOtherStaticAccount11111111111111111111"],
+        loaded_writable=[WALLET],
+    )
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value=result))
+
+    parsed = asyncio.run(trade_execution.parse_fill_from_transaction(
+        "sig-alt", MINT, owner_pubkey=WALLET,
+    ))
+
+    assert parsed["real_sol_delta"] == pytest.approx(-0.00005)
+
+
+def test_parse_fill_raises_on_reverted_transaction(monkeypatch):
+    result = _tx_result(
+        pre_token=[], post_token=[], pre_bal=[1], post_bal=[1],
+        account_keys=[WALLET], err={"InstructionError": [0, "slippage exceeded"]},
+    )
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value=result))
+
+    with pytest.raises(trade_execution.FillParseError):
+        asyncio.run(trade_execution.parse_fill_from_transaction(
+            "sig-reverted", MINT, owner_pubkey=WALLET,
+        ))
+
+
+def test_parse_fill_raises_when_transaction_not_found(monkeypatch):
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value=None))
+
+    with pytest.raises(trade_execution.FillParseError):
+        asyncio.run(trade_execution.parse_fill_from_transaction(
+            "sig-notfound", MINT, owner_pubkey=WALLET,
+        ))
+
+
+def test_parse_fill_raises_when_no_matching_token_balance(monkeypatch):
+    result = _tx_result(
+        pre_token=[_token_entry("SomeoneElse1111111111111111111111111111", MINT, 100, 6)],
+        post_token=[],
+        pre_bal=[1_000_000_000], post_bal=[999_995_000],
+        account_keys=[WALLET],
+    )
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value=result))
+
+    with pytest.raises(trade_execution.FillParseError):
+        asyncio.run(trade_execution.parse_fill_from_transaction(
+            "sig-nomatch", MINT, owner_pubkey=WALLET,
+        ))

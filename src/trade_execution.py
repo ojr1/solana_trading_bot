@@ -409,6 +409,187 @@ async def execute_swap(output_mint: str, amount_sol: float,
     }
 
 
+# ==========================================================================
+# FILL PARSING (Stage 10 Part 4, 30 Aug 2026)
+#
+# LIVE_EXECUTION_PLAN.md Gap 4/Stage 4: execute_swap() returns the PRE-trade
+# quote, not what was actually received - real slippage means the two can
+# differ. This parses the CONFIRMED transaction itself (getTransaction) to
+# recover the real amounts, rather than diffing wallet balances before and
+# after: balance-diffing is unsafe the moment more than one position can
+# have a trade in flight at overlapping times (which Stage 10 Part 2's
+# in-flight registry explicitly allows) - any other activity on the wallet
+# between two balance snapshots would contaminate the diff. Parsing is
+# scoped to exactly one signature and stays correct regardless of what else
+# the wallet is doing.
+#
+# NOT WIRED INTO runner.py. Standalone, unit-tested against mocked
+# getTransaction responses built from the documented RPC shape. See
+# AUTONOMOUS_RUN_REPORT.md for what verification against a real signature
+# was and was not possible this run.
+# ==========================================================================
+
+
+class FillParseError(Exception):
+    """
+    A confirmed transaction could not be parsed into real fill amounts -
+    e.g. the transaction is not found, not yet finalised, reverted, or has
+    no balance entry for our wallet/mint. Never guess a fill amount; raise
+    instead.
+    """
+
+
+async def _fetch_transaction(session, signature):
+    """
+    One getTransaction call. maxSupportedTransactionVersion=0 is required
+    for versioned (v0) transactions, which Jupiter swaps commonly are -
+    without it, Helius rejects the request for any v0 tx. Split out, same
+    reasoning as _fetch_signature_status(): lets tests mock exactly this
+    call without faking aiohttp.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}],
+    }
+    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+    async with session.post(config.HELIUS_RPC_URL, json=payload,
+                            timeout=timeout) as response:
+        data = await response.json()
+    return data.get("result")
+
+
+async def parse_fill_from_transaction(signature, mint, owner_pubkey=None):
+    """
+    Parses a CONFIRMED transaction to recover what it ACTUALLY moved.
+
+    Returns:
+        {
+            "real_token_delta": float,  # signed; +received (buy), -sent (sell)
+            "real_sol_delta": float,    # signed SOL, already NET of the fee
+                                         # (see below) - +received, -spent
+            "fee_sol": float,           # reported separately for logging;
+                                         # already reflected in real_sol_delta,
+                                         # do not subtract it again
+            "decimals": int,            # the mint's decimals, as reported by
+                                         # this transaction's own balances -
+                                         # not assumed, not hardcoded
+        }
+
+    owner_pubkey defaults to wallet.get_public_key() (our own wallet) -
+    overridable for testing without needing a real configured wallet.
+
+    ATA resolution: token balances (preTokenBalances/postTokenBalances) are
+    self-describing - each entry already carries its own owner, mint, and
+    decimals, so no separate account-lookup step is needed to find "our"
+    token account; just filter by owner and mint. An entry absent from
+    preTokenBalances means the account did not exist before this tx (e.g.
+    an ATA created by this exact swap - true "pre" balance is 0); absent
+    from postTokenBalances means it was fully drained (true "post" balance
+    is 0). Both are handled as 0, not skipped.
+
+    SOL balance: unlike token balances, preBalances/postBalances are
+    indexed positionally against the FULL account list, which - for a
+    versioned transaction using Jupiter's address lookup tables - is the
+    static message accountKeys PLUS meta.loadedAddresses.writable PLUS
+    meta.loadedAddresses.readonly, in that order. Using only the static
+    accountKeys (skipping loadedAddresses) would find the WRONG index, or
+    none, for any transaction that used a lookup table - silently wrong,
+    not a crash. This is handled by concatenating all three lists before
+    searching for our pubkey.
+
+    Fee netting: preBalances/postBalances already reflect the ACTUAL
+    lamport change including the network fee for whichever account paid it
+    (always account index 0, the fee payer - our own wallet, since we are
+    the one submitting). So real_sol_delta = (post - pre) / 1e9 is already
+    fee-inclusive; fee_sol is reported alongside for visibility only, never
+    added or subtracted again.
+
+    Raises FillParseError if the transaction cannot be found, is not yet
+    finalised, reverted (meta.err is non-null - see Part 1's confirm_transaction()
+    fix; a reverted tx moved nothing, so there is nothing to parse), or has
+    no matching balance entries.
+    """
+    owner = owner_pubkey if owner_pubkey is not None else str(wallet.get_public_key())
+
+    async with aiohttp.ClientSession() as session:
+        result = await _fetch_transaction(session, signature)
+
+    if result is None:
+        raise FillParseError(
+            f"getTransaction returned no result for {signature} - not "
+            f"found, or not yet finalised. Try again once confirmed."
+        )
+
+    meta = result.get("meta") or {}
+    if meta.get("err") is not None:
+        raise FillParseError(
+            f"transaction {signature} reverted (err={meta['err']}) - no "
+            f"funds moved, nothing to parse."
+        )
+
+    # --- Token leg -----------------------------------------------------
+    pre_token = _find_token_balance(meta.get("preTokenBalances") or [], owner, mint)
+    post_token = _find_token_balance(meta.get("postTokenBalances") or [], owner, mint)
+
+    if pre_token is None and post_token is None:
+        raise FillParseError(
+            f"no {mint} token balance for owner {owner} in either "
+            f"preTokenBalances or postTokenBalances of {signature} - "
+            f"wrong mint, wrong owner, or this transaction did not touch "
+            f"that token at all."
+        )
+
+    decimals = (post_token or pre_token)["uiTokenAmount"]["decimals"]
+    pre_amount = int(pre_token["uiTokenAmount"]["amount"]) if pre_token else 0
+    post_amount = int(post_token["uiTokenAmount"]["amount"]) if post_token else 0
+    real_token_delta = (post_amount - pre_amount) / (10 ** decimals)
+
+    # --- SOL leg ---------------------------------------------------------
+    account_keys = list(result["transaction"]["message"].get("accountKeys") or [])
+    loaded = meta.get("loadedAddresses") or {}
+    account_keys += list(loaded.get("writable") or [])
+    account_keys += list(loaded.get("readonly") or [])
+
+    try:
+        our_index = account_keys.index(owner)
+    except ValueError:
+        raise FillParseError(
+            f"owner {owner} not found in the account list (static + "
+            f"loaded) of {signature} - cannot determine the SOL delta."
+        )
+
+    pre_balances = meta.get("preBalances") or []
+    post_balances = meta.get("postBalances") or []
+    if our_index >= len(pre_balances) or our_index >= len(post_balances):
+        raise FillParseError(
+            f"account index {our_index} out of range for pre/postBalances "
+            f"of {signature} - malformed or unexpected transaction shape."
+        )
+
+    real_sol_delta = (post_balances[our_index] - pre_balances[our_index]) / 1_000_000_000
+    fee_sol = meta.get("fee", 0) / 1_000_000_000
+
+    return {
+        "real_token_delta": real_token_delta,
+        "real_sol_delta": real_sol_delta,
+        "fee_sol": fee_sol,
+        "decimals": decimals,
+    }
+
+
+def _find_token_balance(entries, owner, mint):
+    """Returns the first entry in a preTokenBalances/postTokenBalances list
+    matching this owner and mint, or None. Self-contained lookup - each
+    entry already carries owner/mint/decimals, no separate account-lookup
+    step needed (see parse_fill_from_transaction()'s docstring)."""
+    for entry in entries:
+        if entry.get("owner") == owner and entry.get("mint") == mint:
+            return entry
+    return None
+
+
 async def main():
     """Read-only quote test. Does not sign or submit anything."""
     USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
