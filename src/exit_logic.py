@@ -21,6 +21,8 @@ so it can be tested offline against simulated price paths:
 
 import math
 
+import config
+
 # ==========================================================================
 # TUNABLE PARAMETERS
 # ==========================================================================
@@ -31,8 +33,11 @@ import math
 # number it may never reach.
 INITIALS_TRIGGER_GAIN = 0.95
 
-# Fraction of the position sold when initials are taken.
-INITIALS_SELL_FRACTION = 0.50
+# INITIALS_SELL_FRACTION lives in config.py / .env (Stage 8) rather than
+# being hardcoded here, so it can be re-tuned without a code change -
+# consistent with the Stage 3 entry-sizing values (see entry_logic.py).
+# Kept as a module-level alias so every reference below is unchanged.
+INITIALS_SELL_FRACTION = config.INITIALS_SELL_FRACTION  # fraction of the position sold when initials are taken
 
 # Fraction of the REMAINING position sold at each ladder level. Because this
 # compounds against a shrinking balance, the ladder never fully closes a

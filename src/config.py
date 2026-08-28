@@ -200,6 +200,18 @@ MIN_BUY_SOL = _as_float(
     "MIN_BUY_SOL", _require("MIN_BUY_SOL"), min_value=0.0001
 )
 
+# --- Exit strategy (Stage 8, moved from exit_logic.py) ---------------------
+# Fraction of the position sold when initials are taken. Kept here rather
+# than hardcoded in exit_logic.py so it can be re-tuned via .env alone,
+# consistent with the Stage 3 entry-sizing values above. min_value=0.0001 is
+# the same "must be positive" convention used for MIN_LOT_SOL/MAX_LOT_SOL/
+# MIN_BUY_SOL above; max_value=1.0 because selling more than the whole
+# position is meaningless.
+INITIALS_SELL_FRACTION = _as_float(
+    "INITIALS_SELL_FRACTION", _require("INITIALS_SELL_FRACTION"),
+    min_value=0.0001, max_value=1.0,
+)
+
 
 # ---------------------------------------------------------------------------
 # Startup logging - every secret masked
@@ -237,6 +249,7 @@ def log_resolved_config():
     log.info("config: MIN_LOT_SOL=%s SOL", MIN_LOT_SOL)
     log.info("config: MAX_LOT_SOL=%s SOL", MAX_LOT_SOL)
     log.info("config: MIN_BUY_SOL=%s SOL", MIN_BUY_SOL)
+    log.info("config: INITIALS_SELL_FRACTION=%s", INITIALS_SELL_FRACTION)
     log.info("config: TELEGRAM_API_ID=%s", _mask(str(TELEGRAM_API_ID)))
     log.info("config: TELEGRAM_API_HASH=%s", _mask(TELEGRAM_API_HASH))
     log.info("config: TELEGRAM_CHANNEL=%s", TELEGRAM_CHANNEL)

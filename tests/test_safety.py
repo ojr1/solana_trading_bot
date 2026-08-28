@@ -36,6 +36,7 @@ if str(SRC_DIR) not in sys.path:
 
 import config          # noqa: E402
 import data_logger     # noqa: E402
+import exit_logic      # noqa: E402
 import runner          # noqa: E402
 import trade_execution  # noqa: E402
 import wallet           # noqa: E402
@@ -684,3 +685,50 @@ def test_price_history_write_failure_does_not_propagate(
     # The rest of the cycle must still have completed - proven by the position
     # remaining exactly as it was (not closed, unmodified), not by a crash.
     assert positions[p["contract_address"]]["closed"] is False
+
+
+# ---------------------------------------------------------------------------
+# STAGE 8 - INITIALS_SELL_FRACTION moved to config.py / .env, set to 0.33,
+# brief_stage8_initials_fraction.md
+#
+# exit_logic.check_exit_conditions() is exercised directly, against the real
+# configured value (config.INITIALS_SELL_FRACTION via exit_logic's module-
+# level alias) rather than a monkeypatched one - the point is to prove the
+# actual .env value now in effect fires at 33%, not 50%, end to end through
+# the real firing path (including spike confirmation), not just that the
+# constant equals 0.33 in isolation.
+# ---------------------------------------------------------------------------
+
+
+def test_initials_sells_33_percent_not_50():
+    entry_mc = 20_000
+    position = {
+        "closed": False, "entry_mc": entry_mc, "peak_mc": entry_mc,
+        "initials_taken": False, "tokens_remaining": 1.0, "original_tokens": 1.0,
+        "last_sell_mc": None, "fired_levels": [], "pending": None,
+    }
+    trigger_mc = entry_mc * (1 + exit_logic.INITIALS_TRIGGER_GAIN)
+    now = 1_000_000.0
+
+    # First sighting only arms the spike-confirmation timer (_confirm()) -
+    # it never fires on the first call.
+    actions = exit_logic.check_exit_conditions(position, trigger_mc, now)
+    assert actions == [], "initials must not fire on the first sighting of the trigger"
+
+    # Second call, price held steady, past CONFIRM_DELAY_SECONDS - fires.
+    actions = exit_logic.check_exit_conditions(
+        position, trigger_mc, now + exit_logic.CONFIRM_DELAY_SECONDS + 0.1,
+    )
+
+    assert len(actions) == 1
+    action = actions[0]
+    assert action["exit_type"] == "initials"
+    assert action["fraction_of_remaining"] == pytest.approx(0.33), (
+        "must sell the configured 0.33, not the old hardcoded 0.50"
+    )
+    assert action["pct_of_original_position"] == pytest.approx(33.0, abs=0.01)
+    assert position["tokens_remaining"] == pytest.approx(0.67, abs=1e-9), (
+        "67% of the original position must remain, not 50%"
+    )
+    assert position["closed"] is False, \
+        "67% remains after initials - the position must stay open"
