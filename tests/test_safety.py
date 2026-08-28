@@ -238,17 +238,22 @@ def test_dry_run_never_reaches_submission(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# STAGE 3 - SMALL-WALLET SIZING (0.3 SOL), brief_stage3_golive.md Step 2
+# STAGE 4 - RESIZE FOR A 2-3 SOL WALLET, brief_stage4_resize.md Step 3
 #
-# entry_logic.decide_entry() is mocked to a fixed decision in these tests
-# rather than relied on to produce an exact PCR - the guards being tested
-# here (concurrency cap, reserve check, the new DCA-time position-size cap)
-# are runner.py's, not entry_logic's, and a fixed decision makes the wallet
-# arithmetic exact and the tests independent of the PCR formula. Every
-# accepted decision still carries a single tranche, matching reality at
-# this sizing: a two-stage split needs a lot of at least 0.1875 SOL
-# (0.4 x lot >= MIN_BUY_SOL), above MAX_LOT_SOL (0.15) itself, so DCA can
-# never actually fire at this wallet size at all - see SIZING_REPORT.md.
+# Updated in place from stage 3's 0.3 SOL / MAX_CONCURRENT_POSITIONS=3 /
+# MAX_POSITION_SOL=0.15 tests, per instruction ("Update them for the new
+# values", not "add alongside them"). The stage 1 tests above this section
+# are untouched, as instructed separately.
+#
+# entry_logic.decide_entry() is still mocked to a fixed decision - the
+# guards under test (concurrency cap, reserve check, the DCA-time
+# position-size cap) are runner.py's, not entry_logic's, and a fixed
+# decision makes the wallet arithmetic exact and independent of the PCR
+# formula. Unlike stage 3, a single-tranche decision here is a choice, not
+# a forced consequence: at MAX_LOT_SOL=0.25 two-stage DCA IS reachable
+# again for a high enough PCR (needs lot >= 0.1875 SOL) - see
+# RESIZE_REPORT.md Step 2. These guard tests still use MIN_LOT_SOL-sized,
+# single-tranche fixtures deliberately, to keep the wallet arithmetic exact.
 # ---------------------------------------------------------------------------
 
 
@@ -278,66 +283,67 @@ def _stable_price_stub(mc):
     return fake_fetch_token_details
 
 
-def test_three_positions_at_min_lot_fit_a_0_3_sol_wallet_fourth_refused(
+def test_ten_positions_at_min_lot_fit_a_2_5_sol_wallet_eleventh_refused(
     isolated_positions, monkeypatch,
 ):
     """
-    Items 1, 2, 3 and 6 together: they are one scenario, not four independent
-    ones. On a simulated 0.3 SOL wallet, MIN_LOT_SOL=0.075 entries:
-      1. the first is allowed, sized at MIN_LOT_SOL
-      2. three concurrent (0.225 SOL total) are allowed
-      3. a fourth is refused - and by WHICH guard is asserted explicitly
-      6. the 0.05 SOL reserve is never breached by any of the three allowed
+    Combined scenario, matching stage 3's approach: on a simulated 2.5 SOL
+    wallet, MIN_LOT_SOL=0.075 entries:
+      - ten concurrent (0.75 SOL total) are allowed
+      - an eleventh is refused - and by WHICH guard is asserted explicitly
+      - the 0.05 SOL reserve is never breached by any of the ten allowed
     """
     positions, calls_path = isolated_positions
     monkeypatch.setattr(config, "MIN_LOT_SOL", 0.075)
-    monkeypatch.setattr(config, "MAX_CONCURRENT_POSITIONS", 3)
+    monkeypatch.setattr(config, "MAX_CONCURRENT_POSITIONS", 10)
     monkeypatch.setattr(config, "MIN_SOL_RESERVE", 0.05)
     monkeypatch.setattr(runner.entry_logic, "decide_entry", _fixed_decision(0.075))
     monkeypatch.setattr(runner.market_data, "fetch_token_details", _stable_price_stub(20_000))
 
-    # Wallet starts at 0.3 SOL, MIN_LOT_SOL each. Sequence of balances the
-    # THIRD, allowed entries will observe: 0.300 -> 0.225 -> 0.150. If the
-    # 4th entry's reserve check is ever reached at all, get_balance() is
-    # called a 4th time and this mock raises (StopIteration/IndexError) -
+    # Wallet starts at 2.5 SOL, MIN_LOT_SOL (0.075) each. Balances the ten
+    # allowed entries will observe: 2.500, 2.425, ... down to 1.750. If the
+    # 11th entry's reserve check is ever reached at all, get_balance() is
+    # called an 11th time and this mock raises (StopIteration/IndexError) -
     # itself proof the wrong guard bound first, not just a missing assert.
-    get_balance = AsyncMock(side_effect=[0.300, 0.225, 0.150])
+    balances = [round(2.500 - 0.075 * i, 4) for i in range(10)]
+    get_balance = AsyncMock(side_effect=balances)
     monkeypatch.setattr(runner.wallet, "get_balance", get_balance)
 
     # Letter suffixes, not digits: a trailing "0" would break the base58
     # contract-address regex in parser.py (0/O/I/l are excluded from
-    # base58), which very nearly cost this test a false failure.
-    for suffix in ("A", "B", "C"):
+    # base58), which very nearly cost this test a false failure at stage 3.
+    suffixes = "ABCDEFGHJK"  # ten letters, skipping I (excluded from base58 too)
+    for suffix in suffixes:
         ticker, contract = f"MINLOT{suffix}", f"TestMinLot{suffix}" + "9" * 32
         event = _FakeEvent(_make_call_text(ticker, contract), datetime.now(timezone.utc))
         asyncio.run(runner.on_message(event))
-        assert contract in positions, f"entry {suffix} of 3 should have been allowed"
+        assert contract in positions, f"entry {suffix} of 10 should have been allowed"
         assert positions[contract]["sol_invested"] >= config.MIN_LOT_SOL
 
-    assert len(positions) == 3
-    assert get_balance.call_count == 3, \
-        "reserve check should have run exactly 3 times, once per allowed entry"
+    assert len(positions) == 10
+    assert get_balance.call_count == 10, \
+        "reserve check should have run exactly 10 times, once per allowed entry"
 
-    # Reserve invariant (item 6): after each allowed entry, remaining
-    # balance never dropped below MIN_SOL_RESERVE.
-    remaining_after_each = [0.300 - 0.075, 0.225 - 0.075, 0.150 - 0.075]
+    # Reserve invariant: after each allowed entry, remaining balance never
+    # dropped below MIN_SOL_RESERVE.
+    remaining_after_each = [b - 0.075 for b in balances]
     assert all(r >= config.MIN_SOL_RESERVE for r in remaining_after_each)
 
-    # The fourth: concurrency cap must fire BEFORE open_position() ever
-    # calls get_balance() again (proven above by call_count staying at 3).
-    ticker4, contract4 = "MINLOTD", "TestMinLotD" + "9" * 32
-    event4 = _FakeEvent(_make_call_text(ticker4, contract4), datetime.now(timezone.utc))
-    asyncio.run(runner.on_message(event4))
+    # The eleventh: concurrency cap must fire BEFORE open_position() ever
+    # calls get_balance() again (proven above by call_count staying at 10).
+    ticker11, contract11 = "MINLOTM", "TestMinLotM" + "9" * 32
+    event11 = _FakeEvent(_make_call_text(ticker11, contract11), datetime.now(timezone.utc))
+    asyncio.run(runner.on_message(event11))
 
-    assert contract4 not in positions, "a 4th concurrent position should be refused"
-    assert get_balance.call_count == 3, \
-        "the 4th attempt must be refused before the reserve check ever runs"
+    assert contract11 not in positions, "an 11th concurrent position should be refused"
+    assert get_balance.call_count == 10, \
+        "the 11th attempt must be refused before the reserve check ever runs"
     records = read_jsonl(calls_path)
-    refusal = [r for r in records if r["contract_address"] == contract4]
-    assert refusal, "no record was logged for the refused 4th entry"
+    refusal = [r for r in records if r["contract_address"] == contract11]
+    assert refusal, "no record was logged for the refused 11th entry"
     assert refusal[0]["event"] == "rejected_concurrency_cap", (
-        f"expected the CONCURRENCY CAP to refuse the 4th entry (it runs before "
-        f"open_position()'s reserve check in on_message()), got "
+        f"expected the CONCURRENCY CAP to refuse the 11th entry (it runs "
+        f"before open_position()'s reserve check in on_message()), got "
         f"{refusal[0]['event']!r} instead"
     )
 
@@ -355,18 +361,18 @@ def test_three_positions_at_min_lot_fit_a_0_3_sol_wallet_fourth_refused(
 
 
 def test_dca_fill_refused_if_it_would_exceed_max_position_sol(monkeypatch):
-    monkeypatch.setattr(config, "MAX_POSITION_SOL", 0.15)
+    monkeypatch.setattr(config, "MAX_POSITION_SOL", 0.25)
 
     position = {
         "ticker": "LEGACY", "contract_address": "TestLegacy1" + "9" * 32,
-        "sol_invested": 0.075, "total_tokens_bought": 1.0, "tokens_remaining": 1.0,
+        "sol_invested": 0.15, "total_tokens_bought": 1.0, "tokens_remaining": 1.0,
         "original_tokens": 1.0, "reference_mc": 20_000, "entry_mc": 20_000,
         "last_fill_mc": 20_000, "initials_taken": False,
         "pending_tranches": [{
-            "stage": 2, "sol": 0.10,  # 0.075 + 0.10 = 0.175 > 0.15 cap
+            "stage": 2, "sol": 0.15,  # 0.15 + 0.15 = 0.30 > 0.25 cap
             "drop_pct_from_previous_fill": 10,
         }],
-        "fills": [{"stage": 1, "sol": 0.075, "mc": 20_000, "at": "2026-01-01T00:00:00+00:00"}],
+        "fills": [{"stage": 1, "sol": 0.15, "mc": 20_000, "at": "2026-01-01T00:00:00+00:00"}],
     }
 
     # Price has dropped enough to trigger the pending tranche on its own terms.
@@ -375,19 +381,19 @@ def test_dca_fill_refused_if_it_would_exceed_max_position_sol(monkeypatch):
     result = asyncio.run(runner.check_dca_fills(position, current_mc))
 
     assert result is None, "the tranche must not fill"
-    assert position["sol_invested"] == 0.075, "sol_invested must be unchanged"
+    assert position["sol_invested"] == 0.15, "sol_invested must be unchanged"
     assert position["pending_tranches"] == [], \
         "the over-cap tranche should be abandoned (popped), not left to retry forever"
 
 
 # ---------------------------------------------------------------------------
-# 5. No code path produces a lot below MIN_LOT_SOL
+# 5. No lot below MIN_LOT_SOL, none above MAX_LOT_SOL
 # ---------------------------------------------------------------------------
 
 
 def test_no_lot_below_min_lot_sol(monkeypatch):
     monkeypatch.setattr(config, "MIN_LOT_SOL", 0.075)
-    monkeypatch.setattr(config, "MAX_LOT_SOL", 0.15)
+    monkeypatch.setattr(config, "MAX_LOT_SOL", 0.25)
 
     import entry_logic
     # entry_logic.MIN_LOT_SOL/MAX_LOT_SOL are aliases assigned at import
