@@ -1529,3 +1529,149 @@ def test_get_quote_sell_defaults_slippage_from_config(monkeypatch):
     asyncio.run(trade_execution.get_quote_sell(MINT, 1.0, decimals=6))
 
     assert captured["slippageBps"] == 1234
+
+
+# ---------------------------------------------------------------------------
+# STAGE 11 - parse_fill_from_transaction() against REAL captured mainnet
+# transaction data, brief_stage11_verify.md Part 3. These are frozen,
+# trimmed snapshots of genuine transactions fetched read-only via the
+# public Solana RPC (signatures/mints/balances are all real, on-chain, and
+# public - not secrets), not synthetic fixtures - they lock in the two
+# real-world shapes the plan/report were least confident about, so a
+# future change to the parsing logic can't silently break them again.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_fill_real_transaction_no_lookup_table(monkeypatch):
+    """A real pump.fun-direct buy with NO address lookup table at all -
+    the simplest real shape, and also happens to be a case where the
+    tracked owner (the buyer) is not the fee payer (index 9, not 0)."""
+    real_tx = {
+        "transaction": {"message": {"accountKeys": [
+            "ocBBRKb13iTq9UJUSMhWLKpDcwAvi3FWR3vHr7wH1qa",
+            "3CkJdfB4paa7FW68MxgTRTXHZvniuvB7Pg1R4LQNb2XS",
+            "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV",
+            "64fzp7CYtBWyfdTS3FYVeEY3EnTtuD87qho5UDZNuV9X",
+            "94UJEyqTzMQLZJDiybwxEEk55WN5b35FkpX5SABPyqkD",
+            "9pAbp1ouuQZGpBK4dNvTvSW6jLW9aRzY6WZXAmftHYQB",
+            "A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW",
+            "AwTinnHnmX3tXezfPBaWDLbA91gZcYkF8T7U6RiA71M6",
+            "FLAShWTjcweNT4NSotpjpxAkwxUr2we3eXQGhpTVzRwy",
+            "GbK6xzejs4kv3pwkheWheopxFBWLLXhyqzrmnFaLXacr",
+            "11111111111111111111111111111111",
+            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+            "SysvarRecentB1ockHashes11111111111111111111",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+            "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+            "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+            "5z5NcfpU6QnPQoFuVzAgfCbsahTBjYBGxP9e2Sympump",
+            "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
+            "BrqMxJ1b2PVCWtzLnmoKeV4MzKhh42BEH1a5y6456JAd",
+            "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1",
+        ]}},
+        "meta": {
+            "err": None, "fee": 5000,
+            "preBalances": [5273993373, 66808910, 35659081619293, 2074080, 1500000,
+                            2040000, 3736249869, 271164985, 727626546, 890580175, 1,
+                            8642112342, 42706560, 70128638, 6046721, 4089612040,
+                            3744480, 37290293, 0, 168261371],
+            "postBalances": [6153706148, 69475577, 35659085841516, 2074080, 1500000,
+                             0, 3740472091, 271164985, 727726546, 1691288, 1,
+                             8642112342, 42706560, 70128638, 6046721, 4089612040,
+                             3744480, 37290293, 0, 168261371],
+            "preTokenBalances": [
+                {"accountIndex": 3, "mint": "5z5NcfpU6QnPQoFuVzAgfCbsahTBjYBGxP9e2Sympump",
+                 "owner": "GbK6xzejs4kv3pwkheWheopxFBWLLXhyqzrmnFaLXacr",
+                 "uiTokenAmount": {"amount": "969122302228998", "decimals": 6}},
+            ],
+            "postTokenBalances": [
+                {"accountIndex": 3, "mint": "5z5NcfpU6QnPQoFuVzAgfCbsahTBjYBGxP9e2Sympump",
+                 "owner": "GbK6xzejs4kv3pwkheWheopxFBWLLXhyqzrmnFaLXacr",
+                 "uiTokenAmount": {"amount": "1000000000000000", "decimals": 6}},
+            ],
+            "loadedAddresses": {"readonly": [], "writable": []},
+        },
+    }
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value=real_tx))
+
+    parsed = asyncio.run(trade_execution.parse_fill_from_transaction(
+        "real-sig-1", "5z5NcfpU6QnPQoFuVzAgfCbsahTBjYBGxP9e2Sympump",
+        owner_pubkey="GbK6xzejs4kv3pwkheWheopxFBWLLXhyqzrmnFaLXacr",
+    ))
+
+    assert parsed["real_token_delta"] == pytest.approx(30_877_697.771002)
+    assert parsed["real_sol_delta"] == pytest.approx(-0.888888887)
+    assert parsed["decimals"] == 6
+
+
+def test_parse_fill_real_transaction_owner_not_fee_payer(monkeypatch):
+    """A real pump.fun-direct sell, WITH an address lookup table, where the
+    tracked owner is genuinely not the fee payer (account index 5, not 0) -
+    the specific case Stage 10's report section 9 flagged as least
+    confident. real_sol_delta being a clean 1.3 SOL (no fee-sized remainder)
+    is itself evidence the fee was correctly NOT attributed to this owner."""
+    real_tx = {
+        "transaction": {"message": {"accountKeys": [
+            "B2X1KVw78LbcsGQp559dFNXbXKXDt7pTqT5qfzQCWXch",
+            "7pByXrHtG3oxCtDoEWguy5dEmMYhrQ6t2k4vfS9BQjki",
+            "97HXErk3YBSgzdv8pjRAdM3rr84ELp98sjDgF1tcvVd8",
+            "ASTRaoF93eYt73TYvwtsv6fMWHWbGmMUZfVZPo3CRU9C",
+            "Be9aD3mVP8KxwzKVi2Ac489MYuW1mUSdK9ieskq2sWWV",
+            "Hjg3mFh289u8Gcqt9wBcvPx7THKzcLRH31psyjspHckN",
+            "HugmfYmaYAFKrsh5J193TENejtdrGmBmGrWei2i9Kmfj",
+            "11111111111111111111111111111111",
+            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P",
+            "ComputeBudget111111111111111111111111111111",
+            "9kbaEwFHKTpqnhKCqwMmVhg9rhGTD3VGMHNSG4DdQNV9",
+            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+            "CGgasvcMpXSzbVYazytz6GVQteLwP4mNGgAULkZ2pump",
+        ]}},
+        "meta": {
+            "err": None, "fee": 1005000,
+            "preBalances": [4224685424, 2074080, 0, 9741491222, 331594727,
+                            5401691280, 1844400, 1, 8642112342, 1, 0, 3388605308,
+                            3702720, 3460018897, 45848606022, 35659075444293,
+                            17016138, 1009200, 70128638, 6046721, 4089612040,
+                            37290293, 168261371],
+            "postBalances": [2891356344, 2074080, 2074080, 9742491222, 331594727,
+                             6701691280, 5744400, 1, 8642112342, 1, 0, 3388605308,
+                             3702720, 3466193897, 45861606022, 35659081619293,
+                             17016138, 1009200, 70128638, 6046721, 4089612040,
+                             37290293, 168261371],
+            "preTokenBalances": [
+                {"accountIndex": 1, "mint": "CGgasvcMpXSzbVYazytz6GVQteLwP4mNGgAULkZ2pump",
+                 "owner": "Hjg3mFh289u8Gcqt9wBcvPx7THKzcLRH31psyjspHckN",
+                 "uiTokenAmount": {"amount": "836322033898306", "decimals": 6}},
+            ],
+            "postTokenBalances": [
+                {"accountIndex": 1, "mint": "CGgasvcMpXSzbVYazytz6GVQteLwP4mNGgAULkZ2pump",
+                 "owner": "Hjg3mFh289u8Gcqt9wBcvPx7THKzcLRH31psyjspHckN",
+                 "uiTokenAmount": {"amount": "804111716621255", "decimals": 6}},
+                {"accountIndex": 2, "mint": "CGgasvcMpXSzbVYazytz6GVQteLwP4mNGgAULkZ2pump",
+                 "owner": "B2X1KVw78LbcsGQp559dFNXbXKXDt7pTqT5qfzQCWXch",
+                 "uiTokenAmount": {"amount": "32210317277051", "decimals": 6}},
+            ],
+            "loadedAddresses": {
+                "readonly": ["SysvarRent111111111111111111111111111111111",
+                            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+                            "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ",
+                            "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf",
+                            "8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt",
+                            "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1"],
+                "writable": ["9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7",
+                            "nozifLPFsZVvb9Fb8oQX4VUPTdju6HXRQTyQCLsiaG5",
+                            "62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV",
+                            "Hq2wp8uJ9jCPsYgNHex8RtqdvMPfVGoYwjvF1ATiwn2Y"],
+            },
+        },
+    }
+    monkeypatch.setattr(trade_execution, "_fetch_transaction", AsyncMock(return_value=real_tx))
+
+    parsed = asyncio.run(trade_execution.parse_fill_from_transaction(
+        "real-sig-2", "CGgasvcMpXSzbVYazytz6GVQteLwP4mNGgAULkZ2pump",
+        owner_pubkey="Hjg3mFh289u8Gcqt9wBcvPx7THKzcLRH31psyjspHckN",
+    ))
+
+    assert parsed["real_token_delta"] == pytest.approx(-32_210_317.277051)  # SELL
+    assert parsed["real_sol_delta"] == pytest.approx(1.3)
+    assert parsed["fee_sol"] == pytest.approx(0.001005)  # reported, but NOT this owner's cost
