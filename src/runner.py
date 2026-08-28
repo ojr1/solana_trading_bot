@@ -49,6 +49,7 @@ import entry_logic
 import exit_logic
 import market_data
 import parser as message_parser
+import trade_execution
 import trading_window
 import wallet
 
@@ -700,6 +701,7 @@ async def open_position(decision, call):
         "fired_levels": [],
         "closed": False,
         "pending": None,
+        "in_flight_trade": None,  # in-flight REAL trade, if any - Stage 10
         "realised_sol": 0.0,
     }
 
@@ -729,26 +731,34 @@ async def open_position(decision, call):
 # ==========================================================================
 
 
-async def check_dca_fills(position, current_mc):
+def _plan_dca_fill(position, current_mc):
     """
-    Fills the next pending tranche if the price has dropped far enough.
+    Decides WHETHER the next pending tranche should fill, without mutating
+    position at all. Pure - Stage 10 counterpart of exit_logic._plan_sell(),
+    mirrored conceptually on the buy side (see check_dca_fills() and
+    _apply_dca_fill() below for the rest of the split).
 
-    Each drop is measured from the PREVIOUS fill rather than cumulatively from
-    the first buy, so a three-stage entry completes around 19% below buy 1
-    rather than 20%.
+    Returns None if nothing is due to fill (no pending tranche, initials
+    already taken, at/below the absolute floor, or the drop trigger not yet
+    reached). Returns {"invalid_tranche": tranche} if the next tranche has
+    an unrecognised shape - not a fill decision, a data problem for the
+    caller to discard. Otherwise returns a plan dict describing the fill
+    that WOULD happen.
+
+    Each drop is measured from the PREVIOUS fill rather than cumulatively
+    from the first buy, so a three-stage entry completes around 19% below
+    buy 1 rather than 20%.
 
     DCA stops once initials have been taken. Past that point the position is
     being wound down, and adding to it would contradict the exit that is
     already in progress.
 
     DCA also stops at the absolute floor. The floor check inside exit_logic
-    runs first within that function, but this function is called BEFORE it in
-    the monitor cycle - so without the guard below, a position sitting under
-    the floor would take one more tranche and then be sold at the same price
-    microseconds later. In a dry run that only distorts the log; live it is
-    real capital committed to a position already being closed, plus a wasted
-    swap fee. The floor value is read from exit_logic so there is one
-    definition of "dead" rather than two that can drift apart.
+    runs first within that function, but check_dca_fills() runs BEFORE it in
+    the monitor cycle - so without this guard, a position sitting under the
+    floor would take one more tranche and then be sold at the same price
+    microseconds later. The floor value is read from exit_logic so there is
+    one definition of "dead" rather than two that can drift apart.
     """
     if position["initials_taken"] or not position["pending_tranches"]:
         return None
@@ -767,6 +777,65 @@ async def check_dca_fills(position, current_mc):
         "drop_pct_from_previous_fill", next_tranche.get("drop_pct")
     )
     if drop_pct is None:
+        return {"invalid_tranche": next_tranche}
+
+    drop = drop_pct / 100.0
+    trigger_mc = position["last_fill_mc"] * (1 - drop)
+    if current_mc > trigger_mc:
+        return None
+
+    tokens = tokens_for(next_tranche["sol"], current_mc, position["reference_mc"])
+    return {
+        "tranche": next_tranche,
+        "sol": next_tranche["sol"],
+        "mc": current_mc,
+        "tokens": tokens,
+    }
+
+
+def _apply_dca_fill(position, plan, real_tokens_bought=None):
+    """
+    Mutates position to reflect a DCA tranche that has ACTUALLY filled.
+
+    real_tokens_bought overrides plan["tokens"] when a real trade's actual
+    fill differs from the plan - same reasoning as exit_logic._apply_sell()'s
+    real_tokens_sold. Defaults to the planned amount, exactly correct for
+    DRY_RUN.
+
+    Caller is responsible for popping position["pending_tranches"] - kept
+    outside this function since check_dca_fills() also needs to pop it on
+    an ABANDONED (over-cap) tranche, which is not a fill being applied.
+    """
+    tranche = plan["tranche"]
+    tokens = plan["tokens"] if real_tokens_bought is None else real_tokens_bought
+
+    position["sol_invested"] += tranche["sol"]
+    position["total_tokens_bought"] += tokens
+    position["tokens_remaining"] += tokens
+    position["original_tokens"] += tokens
+    position["last_fill_mc"] = plan["mc"]
+    position["fills"].append(
+        {"stage": tranche["stage"], "sol": tranche["sol"],
+         "mc": plan["mc"], "at": datetime.now(timezone.utc).isoformat()}
+    )
+
+    # Averaging down moves break-even, which moves every exit threshold with it.
+    position["entry_mc"] = breakeven_mc(position)
+
+
+async def check_dca_fills(position, current_mc):
+    """
+    Orchestrates a DCA tranche fill: plan (_plan_dca_fill, pure) -> guards
+    that depend on more than just price (size cap, reserve) -> apply
+    (_apply_dca_fill, mutates). DRY_RUN applies immediately, matching
+    _monitor_once()'s sell-side handling - there is no real trade to wait
+    for here either. See _plan_dca_fill()'s docstring for the fill rules.
+    """
+    plan = _plan_dca_fill(position, current_mc)
+    if plan is None:
+        return None
+
+    if "invalid_tranche" in plan:
         # An unrecognised tranche format - refuse to guess a trigger for it.
         log.warning(
             "DCA tranche for %s has no drop percentage - skipping it. "
@@ -775,11 +844,8 @@ async def check_dca_fills(position, current_mc):
         )
         position["pending_tranches"].pop(0)
         return None
-    drop = drop_pct / 100.0
-    trigger_mc = position["last_fill_mc"] * (1 - drop)
 
-    if current_mc > trigger_mc:
-        return None
+    next_tranche = plan["tranche"]
 
     # POSITION SIZE CAP (Stage 3 safety, 28 Aug 2026). Under normal operation
     # a position's tranches can never sum past MAX_POSITION_SOL - the
@@ -816,34 +882,127 @@ async def check_dca_fills(position, current_mc):
         )
         return None
 
-    # Fill it.
+    # Fill it. DRY_RUN: applied immediately, right here - a later live-
+    # execution stage is what would instead write in_flight_trade and defer
+    # this call until a real trade confirms.
     position["pending_tranches"].pop(0)
-    tokens = tokens_for(next_tranche["sol"], current_mc, position["reference_mc"])
-
-    position["sol_invested"] += next_tranche["sol"]
-    position["total_tokens_bought"] += tokens
-    position["tokens_remaining"] += tokens
-    position["original_tokens"] += tokens
-    position["last_fill_mc"] = current_mc
-    position["fills"].append(
-        {"stage": next_tranche["stage"], "sol": next_tranche["sol"],
-         "mc": current_mc, "at": datetime.now(timezone.utc).isoformat()}
-    )
-
-    # Averaging down moves break-even, which moves every exit threshold with it.
-    position["entry_mc"] = breakeven_mc(position)
+    _apply_dca_fill(position, plan)
 
     data_logger.log_fill(
-        "buy", position, next_tranche["sol"], current_mc,
+        "buy", position, next_tranche["sol"], plan["mc"],
         stage=next_tranche["stage"],
     )
 
     return {
         "stage": next_tranche["stage"],
         "sol": next_tranche["sol"],
-        "mc": current_mc,
+        "mc": plan["mc"],
         "new_entry_mc": position["entry_mc"],
     }
+
+
+# ==========================================================================
+# IN-FLIGHT TRADE RECOVERY (Stage 10, 30 Aug 2026)
+#
+# LIVE_EXECUTION_PLAN.md question 1's "restart mid-flight" answer. Runs
+# once at startup, before the monitor loop's first cycle - see main().
+#
+# Nothing in this codebase currently WRITES position["in_flight_trade"] -
+# no live execution path is wired in yet (a later, out-of-scope stage per
+# LIVE_EXECUTION_PLAN.md). This function is real, tested infrastructure
+# (exercised by tests that construct an in_flight_trade directly), not a
+# stub - ready for whichever later stage starts populating the field. In
+# every DRY_RUN run today it iterates zero positions and makes no network
+# call at all, since the field is always None.
+# ==========================================================================
+
+
+async def recover_in_flight_trades():
+    """
+    Walks every position for a non-empty in_flight_trade left over from a
+    previous process that never resolved it (a crash, a kill, a restart),
+    and resolves each one per LIVE_EXECUTION_PLAN.md's failure table:
+
+      no signature recorded  -> the process died before submission could
+          plausibly have succeeded. Clear the flag; the original trigger
+          re-evaluates fresh on the next monitor cycle.
+      signature recorded, confirm_transaction() says:
+        "confirmed" -> the trade DID land - apply the missed state update
+            now (_apply_sell() or _apply_dca_fill(), by direction), then
+            clear the flag. Never silently lost.
+        "failed"    -> confirmed REVERTED on-chain - known outcome, no
+            funds moved. Clear the flag, no state change, re-evaluate
+            fresh.
+        "timeout"   -> still genuinely unknown even after a restart -
+            cannot safely guess either way. Leave in_flight_trade in
+            place (so nothing re-attempts on top of it) and alert for
+            human review.
+
+    confirm_transaction() here is a read-only status POLL (getSignatureStatuses)
+    - never submits or signs anything - so this makes no call that could
+    spend money, consistent with brief_stage10_autonomous.md constraint 2.
+
+    Returns a list of (contract, outcome) tuples for logging/testing.
+    """
+    outcomes = []
+    for contract, position in POSITIONS.items():
+        in_flight = position.get("in_flight_trade")
+        if not in_flight:
+            continue
+
+        signature = in_flight.get("signature")
+        direction = in_flight.get("direction", "?")
+
+        if not signature:
+            log.warning(
+                "RECOVERY %-10s in-flight %s trade had no signature - "
+                "process must have died before submission could plausibly "
+                "have succeeded. Clearing; will re-evaluate fresh.",
+                position["ticker"], direction,
+            )
+            position["in_flight_trade"] = None
+            outcomes.append((contract, "cleared_no_signature"))
+            continue
+
+        status = await trade_execution.confirm_transaction(signature)
+
+        if status == "confirmed":
+            plan = in_flight["plan"]
+            if direction == "sell":
+                exit_logic._apply_sell(position, plan)
+            else:
+                position["pending_tranches"].pop(0)
+                _apply_dca_fill(position, plan)
+            position["in_flight_trade"] = None
+            log.warning(
+                "RECOVERY %-10s in-flight %s trade WAS confirmed on-chain "
+                "after all - applying the missed state update now.",
+                position["ticker"], direction,
+            )
+            outcomes.append((contract, "applied_confirmed"))
+
+        elif status == "failed":
+            position["in_flight_trade"] = None
+            log.warning(
+                "RECOVERY %-10s in-flight %s trade was confirmed REVERTED "
+                "- no funds moved, clearing, will re-evaluate fresh.",
+                position["ticker"], direction,
+            )
+            outcomes.append((contract, "cleared_reverted"))
+
+        else:  # "timeout"
+            alerting.alert(
+                "fill_uncertain",
+                f"{position['ticker']}: in-flight {direction} trade "
+                f"(signature {signature}) is still unresolved after a "
+                f"restart - needs human review. Check "
+                f"https://solscan.io/tx/{signature}",
+            )
+            outcomes.append((contract, "needs_human_review"))
+
+    if outcomes:
+        save_positions(POSITIONS)
+    return outcomes
 
 
 # ==========================================================================
@@ -975,6 +1134,25 @@ async def _monitor_once(session):
 
         data_logger.log_price_point(position, current_mc)
 
+        # IN-FLIGHT TRADE (Stage 10, 30 Aug 2026). A position with a real
+        # trade still pending (not yet confirmed, reverted, or timed out)
+        # must not have a SECOND action decided on top of it - e.g. a second
+        # ladder clip evaluated against a remaining-token figure the first
+        # clip hasn't actually confirmed yet. DCA and exit evaluation are
+        # skipped entirely for this cycle. peak_mc still updates
+        # unconditionally (exit_logic.update_peak() - see its docstring for
+        # why this must never be gated), and the STATUS heartbeat above
+        # already ran regardless of this branch, so the position keeps
+        # showing up in the log even while busy.
+        #
+        # Nothing in this codebase sets in_flight_trade yet - no real
+        # execution path is wired in (that is a later, out-of-scope stage
+        # per LIVE_EXECUTION_PLAN.md). This branch is therefore dormant
+        # today, ready for that stage to populate the field.
+        if position.get("in_flight_trade"):
+            exit_logic.update_peak(position, current_mc)
+            continue
+
         fill = await check_dca_fills(position, current_mc)
         if fill:
             changed = True
@@ -984,32 +1162,40 @@ async def _monitor_once(session):
                 f"{fill['mc']:,.0f}", f"{fill['new_entry_mc']:,.0f}",
             )
 
-        for action in exit_logic.check_exit_conditions(position, current_mc, now):
+        for plan in exit_logic.check_exit_conditions(position, current_mc, now):
             changed = True
-            proceeds = action["tokens"] * (current_mc / position["reference_mc"])
+            proceeds = plan["tokens"] * (current_mc / position["reference_mc"])
+
+            # DRY_RUN applies the plan immediately - there is no real trade
+            # to wait for, so "decided" and "happened" are the same instant
+            # here. Once live execution is wired in a later stage, this is
+            # the point that becomes "write in_flight_trade, hand off to a
+            # background task, and call _apply_sell() only after that task's
+            # trade confirms" instead.
+            exit_logic._apply_sell(position, plan)
             position["realised_sol"] += proceeds
 
             log.info(
                 "SELL  %-10s %-13s %.1f%% at $%s  -> %.4f SOL  | %s",
-                position["ticker"], action["exit_type"],
-                action["pct_of_original_position"], f"{current_mc:,.0f}",
-                proceeds, action["reason"],
+                position["ticker"], plan["exit_type"],
+                plan["pct_of_original_position"], f"{current_mc:,.0f}",
+                proceeds, plan["reason"],
             )
             data_logger.log_fill(
                 "sell", position, None, current_mc,
-                exit_type=action["exit_type"],
-                pct_of_original=action["pct_of_original_position"],
+                exit_type=plan["exit_type"],
+                pct_of_original=plan["pct_of_original_position"],
                 proceeds_sol=proceeds,
-                reason=action["reason"],
-                position_closed=action["position_closed"],
+                reason=plan["reason"],
+                position_closed=position["closed"],
             )
 
-            if action["position_closed"]:
+            if position["closed"]:
                 # Recorded so the loss cooldown can time itself, and so later
                 # analysis can group closes by how they ended without having
                 # to replay the fill history.
                 position["closed_at"] = datetime.now(timezone.utc).isoformat()
-                position["last_exit_type"] = action["exit_type"]
+                position["last_exit_type"] = plan["exit_type"]
 
                 pnl = position["realised_sol"] - position["sol_invested"]
                 log.info(
@@ -1262,6 +1448,16 @@ async def main():
     if not is_open:
         log.info("  entries are gated off; exits on open positions still run")
     log.info("=" * 66)
+
+    # IN-FLIGHT TRADE RECOVERY (Stage 10, 30 Aug 2026). Before the monitor
+    # loop's first cycle, resolve anything left over from a previous
+    # process that never finished it - see recover_in_flight_trades()'s
+    # docstring. A no-op today (nothing yet sets in_flight_trade), but
+    # needs to run before monitor_positions() starts so a future in-flight
+    # trade is never left to rot, or double-acted-on, across a restart.
+    recovered = await recover_in_flight_trades()
+    if recovered:
+        log.warning("RECOVERY completed at startup: %s", recovered)
 
     async with client:
         # Both tasks run concurrently: the listener reacts to messages while

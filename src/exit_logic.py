@@ -138,6 +138,7 @@ def new_position(ticker, contract_address, entry_mc, sol_invested, tokens):
         "fired_levels": [],
         "closed": False,
         "pending": None,  # in-flight spike confirmation, if any
+        "in_flight_trade": None,  # in-flight REAL trade, if any - Stage 10
     }
 
 
@@ -234,17 +235,30 @@ def _clear_pending(position):
 # ==========================================================================
 
 
-def _sell(position, fraction_of_remaining, reason, current_mc, exit_type):
-    """Builds a sell instruction and updates the position's holdings."""
+def _plan_sell(position, fraction_of_remaining, reason, current_mc, exit_type,
+               initials_level=None, fired_levels_to_add=None):
+    """
+    Computes what a sell WOULD do, without mutating position at all.
+
+    Stage 10 (30 Aug 2026): split out of the old _sell(), which used to
+    mutate position the instant an exit condition evaluated true - before
+    any trade could possibly have been attempted, let alone confirmed. This
+    half is pure and safe to call speculatively; _apply_sell() below is the
+    only half that mutates, and is meant to be called only once a sell has
+    actually happened (in DRY_RUN, that's immediately - see
+    runner._monitor_once(); once live execution is wired in a later stage,
+    only after a confirmed fill).
+
+    initials_level / fired_levels_to_add: exit-type-specific bookkeeping
+    that check_exit_conditions() used to write onto position directly
+    (position["initials_taken"]/["initials_mc"], position["fired_levels"])
+    before the sell was even attempted. Carried through the plan instead, so
+    _apply_sell() can write them at the same time as everything else - only
+    once the sell is confirmed to have happened.
+    """
     tokens = position["tokens_remaining"] * fraction_of_remaining
-    position["tokens_remaining"] -= tokens
-    position["last_sell_mc"] = current_mc
-
-    # Anything at or beyond a full exit closes the position outright.
-    if fraction_of_remaining >= 1.0 or position["tokens_remaining"] <= 0:
-        position["tokens_remaining"] = 0.0
-        position["closed"] = True
-
+    remaining_after = position["tokens_remaining"] - tokens
+    will_close = fraction_of_remaining >= 1.0 or remaining_after <= 0
     pct_of_original = tokens / position["original_tokens"] * 100
 
     return {
@@ -255,9 +269,66 @@ def _sell(position, fraction_of_remaining, reason, current_mc, exit_type):
         "tokens": tokens,
         "fraction_of_remaining": fraction_of_remaining,
         "pct_of_original_position": round(pct_of_original, 2),
-        "tokens_left": position["tokens_remaining"],
-        "position_closed": position["closed"],
+        "tokens_left": 0.0 if will_close else remaining_after,
+        "position_closed": will_close,
+        "initials_level": initials_level,
+        "fired_levels_to_add": fired_levels_to_add,
     }
+
+
+def _apply_sell(position, plan, real_tokens_sold=None):
+    """
+    Mutates position to reflect a sell that has ACTUALLY happened.
+
+    real_tokens_sold overrides plan["tokens"] when the real amount a
+    confirmed trade filled differs from what was planned (relevant once
+    live execution and real fill-amount parsing exist - see
+    LIVE_EXECUTION_PLAN.md Gap 4/Stage 4). Defaults to the planned amount,
+    which is exactly correct for DRY_RUN, where nothing else could have
+    happened.
+
+    Only mutates: tokens_remaining, closed, last_sell_mc, and (per
+    exit_type) initials_taken/initials_mc or fired_levels. peak_mc is
+    NEVER touched here - it must keep updating every cycle regardless of
+    any in-flight trade (see check_exit_conditions()'s unconditional peak
+    tracking), never gated behind this function.
+
+    Returns position["closed"] after applying, for convenience.
+    """
+    tokens = plan["tokens"] if real_tokens_sold is None else real_tokens_sold
+
+    position["tokens_remaining"] -= tokens
+    position["last_sell_mc"] = plan["at_mc"]
+
+    if plan["exit_type"] == "initials":
+        position["initials_taken"] = True
+        position["initials_mc"] = plan["initials_level"]
+    elif plan["exit_type"] == "ladder_clip":
+        position["fired_levels"].extend(plan["fired_levels_to_add"])
+
+    if plan["fraction_of_remaining"] >= 1.0 or position["tokens_remaining"] <= 0:
+        position["tokens_remaining"] = 0.0
+        position["closed"] = True
+
+    return position["closed"]
+
+
+def update_peak(position, current_mc):
+    """
+    Unconditional peak tracking - the trailing stop's reference point.
+
+    Stage 10 (30 Aug 2026): pulled out of check_exit_conditions() so it can
+    be called on its own for a position with an in-flight trade, whose
+    other exit evaluation is skipped that cycle (see
+    runner._monitor_once()). This must NEVER be gated behind a trade
+    confirmation - it touches no money, and delaying it would make the
+    trailing stop trail a stale peak while a trade is pending. Also called
+    from check_exit_conditions() itself, at the same point in the
+    evaluation order it always ran (after the absolute-floor check, before
+    everything else), so normal-path behaviour is unchanged.
+    """
+    if current_mc > position["peak_mc"]:
+        position["peak_mc"] = current_mc
 
 
 def check_exit_conditions(position, current_mc, now):
@@ -283,7 +354,7 @@ def check_exit_conditions(position, current_mc, now):
     if current_mc <= ABSOLUTE_FLOOR_MC:
         _clear_pending(position)
         return [
-            _sell(
+            _plan_sell(
                 position, 1.0,
                 f"absolute floor: market cap ${current_mc:,.0f} at or below "
                 f"the ${ABSOLUTE_FLOOR_MC:,.0f} dead-coin threshold",
@@ -293,8 +364,7 @@ def check_exit_conditions(position, current_mc, now):
 
     # The peak drives the trailing stop, so it is tracked on every check
     # regardless of whether anything else triggers.
-    if current_mc > position["peak_mc"]:
-        position["peak_mc"] = current_mc
+    update_peak(position, current_mc)
 
     entry = position["entry_mc"]
 
@@ -307,7 +377,7 @@ def check_exit_conditions(position, current_mc, now):
         if current_mc <= stop_level:
             _clear_pending(position)
             return [
-                _sell(
+                _plan_sell(
                     position, 1.0,
                     f"stop-loss: market cap ${current_mc:,.0f} is "
                     f"{(1 - current_mc / entry) * 100:.0f}% below entry "
@@ -322,14 +392,17 @@ def check_exit_conditions(position, current_mc, now):
             if not _confirm(position, "initials", current_mc, now):
                 return []
             _clear_pending(position)
-            position["initials_taken"] = True
-            position["initials_mc"] = initials_level
+            # NOTE: position["initials_taken"]/["initials_mc"] are NOT set
+            # here any more - that used to happen before the sell was even
+            # attempted. They are carried in the plan and only written by
+            # _apply_sell(), once the sell has actually happened.
             return [
-                _sell(
+                _plan_sell(
                     position, INITIALS_SELL_FRACTION,
                     f"initials: up {(current_mc / entry - 1) * 100:.0f}% "
                     f"from entry ${entry:,.0f}",
                     current_mc, "initials",
+                    initials_level=initials_level,
                 )
             ]
 
@@ -342,7 +415,7 @@ def check_exit_conditions(position, current_mc, now):
     if current_mc <= trail_level:
         _clear_pending(position)
         return [
-            _sell(
+            _plan_sell(
                 position, 1.0,
                 f"trailing stop: market cap ${current_mc:,.0f} is "
                 f"{(1 - current_mc / position['peak_mc']) * 100:.0f}% below "
@@ -386,15 +459,21 @@ def check_exit_conditions(position, current_mc, now):
     highest = max(unfired)
 
     _clear_pending(position)
-    position["fired_levels"].extend(unfired)
+    # NOTE: position["fired_levels"] is NOT extended here any more - that
+    # used to happen before the sell was even attempted, which would
+    # permanently mark a level as spent even if the trade that was meant to
+    # clip it never confirmed. Carried in the plan (fired_levels_to_add)
+    # and only written by _apply_sell(), once the sell has actually
+    # happened.
     skipped = len(unfired) - 1
     note = f" (gapped through {skipped} lower level(s))" if skipped else ""
 
     return [
-        _sell(
+        _plan_sell(
             position, LADDER_CLIP_FRACTION,
             f"ladder clip at ${highest:,.0f}{note}",
             current_mc, "ladder_clip",
+            fired_levels_to_add=unfired,
         )
     ]
 
@@ -419,10 +498,16 @@ def _run_path(label, entry_mc, path, tokens=1_000_000.0):
     print()
 
     for mc, t in path:
-        for action in check_exit_conditions(pos, mc, t):
-            print(f"  [{action['exit_type']:<13}] ${mc:>10,.0f}  "
-                  f"sold {action['pct_of_original_position']:>5.1f}% of original  "
-                  f"| {action['reason']}")
+        for plan in check_exit_conditions(pos, mc, t):
+            # Stage 10: check_exit_conditions() now returns PLANS, not
+            # already-applied sells - apply immediately here, matching how
+            # runner._monitor_once() applies a DRY_RUN fill immediately
+            # (nothing to wait for; there is no real trade in this self-test
+            # either).
+            _apply_sell(pos, plan)
+            print(f"  [{plan['exit_type']:<13}] ${mc:>10,.0f}  "
+                  f"sold {plan['pct_of_original_position']:>5.1f}% of original  "
+                  f"| {plan['reason']}")
         if pos["closed"]:
             print("  POSITION CLOSED")
             break

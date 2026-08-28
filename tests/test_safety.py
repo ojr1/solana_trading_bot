@@ -829,22 +829,34 @@ def test_initials_sells_33_percent_not_50():
     assert actions == [], "initials must not fire on the first sighting of the trigger"
 
     # Second call, price held steady, past CONFIRM_DELAY_SECONDS - fires.
-    actions = exit_logic.check_exit_conditions(
+    # check_exit_conditions() now returns a PLAN (Stage 10) - it does not
+    # mutate position on its own any more; _apply_sell() below does.
+    plans = exit_logic.check_exit_conditions(
         position, trigger_mc, now + exit_logic.CONFIRM_DELAY_SECONDS + 0.1,
     )
 
-    assert len(actions) == 1
-    action = actions[0]
-    assert action["exit_type"] == "initials"
-    assert action["fraction_of_remaining"] == pytest.approx(0.33), (
+    assert len(plans) == 1
+    plan = plans[0]
+    assert plan["exit_type"] == "initials"
+    assert plan["fraction_of_remaining"] == pytest.approx(0.33), (
         "must sell the configured 0.33, not the old hardcoded 0.50"
     )
-    assert action["pct_of_original_position"] == pytest.approx(33.0, abs=0.01)
+    assert plan["pct_of_original_position"] == pytest.approx(33.0, abs=0.01)
+
+    # Plan alone must not have touched position state yet.
+    assert position["tokens_remaining"] == 1.0, \
+        "a plan must not mutate position - only _apply_sell() may"
+    assert position["initials_taken"] is False
+
+    exit_logic._apply_sell(position, plan)
+
     assert position["tokens_remaining"] == pytest.approx(0.67, abs=1e-9), (
         "67% of the original position must remain, not 50%"
     )
     assert position["closed"] is False, \
         "67% remains after initials - the position must stay open"
+    assert position["initials_taken"] is True
+    assert position["initials_mc"] == trigger_mc
 
 
 # ---------------------------------------------------------------------------
@@ -938,3 +950,263 @@ def test_alert_logs_at_error_with_distinctive_prefix(caplog):
         and "today's P&L breached the cap" in record.message
         for record in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# STAGE 10 PART 2 - DECIDE/APPLY split and in-flight-trade registry,
+# brief_stage10_autonomous.md
+# ---------------------------------------------------------------------------
+
+
+def _full_position(ticker, contract, initials_taken=False, peak_mc=20_000,
+                    pending_tranches=None, in_flight_trade=None):
+    """Position dict carrying every key exit_logic.check_exit_conditions()
+    and runner.check_dca_fills() read, including the ones _open_position()
+    (Stage 7) omits and gets away with via lucky short-circuiting - Part 2's
+    tests exercise the ladder-clip branch directly, so nothing here can be
+    left implicit."""
+    entry_mc = 20_000
+    return {
+        "ticker": ticker, "contract_address": contract, "closed": False,
+        "entry_mc": entry_mc, "reference_mc": entry_mc, "peak_mc": peak_mc,
+        "last_fill_mc": entry_mc, "call_mc": entry_mc,
+        "sol_invested": 0.2, "realised_sol": 0.0,
+        "total_tokens_bought": 1.0, "tokens_remaining": 1.0, "original_tokens": 1.0,
+        "initials_taken": initials_taken,
+        "initials_mc": entry_mc * 1.95 if initials_taken else None,
+        "pcr": 0.5,
+        "last_sell_mc": None, "fired_levels": [], "pending": None,
+        "in_flight_trade": in_flight_trade,
+        "pending_tranches": pending_tranches if pending_tranches is not None else [],
+        "fills": [
+            {"stage": 1, "sol": 0.2, "mc": entry_mc, "at": "2026-01-01T00:00:00+00:00"},
+        ],
+    }
+
+
+def test_plan_sell_does_not_mutate_apply_sell_does():
+    position = _full_position("PLANTEST", "TestPlanSell1" + "9" * 27,
+                               initials_taken=True)
+    before = dict(position)
+
+    plan = exit_logic._plan_sell(
+        position, 1.0, "trailing stop: test", 10_000, "trailing_stop",
+    )
+    assert position["tokens_remaining"] == before["tokens_remaining"]
+    assert position["closed"] is False
+    assert plan["position_closed"] is True  # the PLAN says it would close...
+
+    exit_logic._apply_sell(position, plan)
+    assert position["closed"] is True  # ...and only applying it actually does
+    assert position["tokens_remaining"] == 0.0
+
+
+def test_plan_dca_fill_does_not_mutate_apply_dca_fill_does():
+    position = _full_position(
+        "DCAPLAN", "TestPlanDca1" + "9" * 27,
+        pending_tranches=[{"stage": 2, "sol": 0.1, "drop_pct_from_previous_fill": 10}],
+    )
+    trigger_mc = position["last_fill_mc"] * 0.85  # well past the 10% drop trigger
+    before_invested = position["sol_invested"]
+
+    plan = runner._plan_dca_fill(position, trigger_mc)
+    assert plan is not None and "invalid_tranche" not in plan
+    assert position["sol_invested"] == before_invested
+    assert position["pending_tranches"] == [
+        {"stage": 2, "sol": 0.1, "drop_pct_from_previous_fill": 10}
+    ], "a plan must not mutate position - only _apply_dca_fill() (plus the caller's pop) may"
+
+    position["pending_tranches"].pop(0)
+    runner._apply_dca_fill(position, plan)
+    assert position["sol_invested"] == pytest.approx(before_invested + 0.1)
+    assert position["pending_tranches"] == []
+
+
+def test_monitor_once_skips_evaluation_for_in_flight_position_but_updates_peak(
+    isolated_positions, monkeypatch,
+):
+    """CRITICAL per the brief: peak tracking must stay unconditional even
+    while a trade is in flight, or the trailing stop trails a stale peak."""
+    positions, _ = isolated_positions
+    contract = "TestInFlight1" + "9" * 27
+    position = _full_position(
+        "INFLIGHT", contract, initials_taken=True, peak_mc=20_000,
+        in_flight_trade={"direction": "sell", "plan": {}, "signature": None},
+    )
+    positions[contract] = position
+
+    # A price that would otherwise fire the trailing stop (and would be a
+    # NEW peak) - must be ignored for exit purposes while in-flight, but
+    # peak_mc must still climb to it.
+    new_high_mc = 30_000
+    monkeypatch.setattr(runner.market_data, "fetch_market_caps",
+                         _mock_fetch_market_caps({contract: new_high_mc}))
+
+    asyncio.run(runner._monitor_once(session=None))
+
+    assert position["peak_mc"] == 30_000, \
+        "peak_mc must update even for an in-flight position"
+    assert position["closed"] is False, \
+        "exit evaluation must be skipped entirely while a trade is in-flight"
+    assert position["tokens_remaining"] == 1.0, "nothing should have been sold"
+
+
+def test_monitor_once_evaluates_normally_once_in_flight_clears(
+    isolated_positions, monkeypatch,
+):
+    """Sanity check on the other side of the skip: a position with NO
+    in-flight trade is evaluated as normal (proves the skip test above is
+    testing the gate, not a coincidence of the fixture)."""
+    positions, _ = isolated_positions
+    contract = "TestNotInFlight1" + "9" * 24
+    position = _full_position("NOTINFLIGHT", contract, initials_taken=True,
+                               peak_mc=100_000, in_flight_trade=None)
+    positions[contract] = position
+
+    trail_fire_mc = 100_000 * (1 - exit_logic.TRAILING_STOP_DRAWDOWN) - 1
+    monkeypatch.setattr(runner.market_data, "fetch_market_caps",
+                         _mock_fetch_market_caps({contract: trail_fire_mc}))
+
+    asyncio.run(runner._monitor_once(session=None))
+
+    assert position["closed"] is True, \
+        "with no in-flight trade, the trailing stop must fire as normal"
+
+
+# ---------------------------------------------------------------------------
+# STAGE 10 PART 2 - startup in-flight-trade recovery walk
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_no_signature_clears_and_does_not_apply(isolated_positions):
+    positions, _ = isolated_positions
+    contract = "TestRecoverNoSig1" + "9" * 22
+    positions[contract] = _full_position(
+        "NOSIG", contract, initials_taken=True,
+        in_flight_trade={"direction": "sell", "plan": {"tokens": 1.0}, "signature": None},
+    )
+
+    outcomes = asyncio.run(runner.recover_in_flight_trades())
+
+    assert outcomes == [(contract, "cleared_no_signature")]
+    assert positions[contract]["in_flight_trade"] is None
+    assert positions[contract]["tokens_remaining"] == 1.0, "nothing should be applied"
+
+
+def test_recovery_confirmed_sell_applies_missed_update(isolated_positions, monkeypatch):
+    positions, _ = isolated_positions
+    contract = "TestRecoverConfSell1" + "9" * 18
+    plan = exit_logic._plan_sell(
+        _full_position("X", contract, initials_taken=True), 1.0,
+        "trailing stop: test", 10_000, "trailing_stop",
+    )
+    positions[contract] = _full_position(
+        "CONFSELL", contract, initials_taken=True,
+        in_flight_trade={"direction": "sell", "plan": plan, "signature": "sig-abc"},
+    )
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="confirmed"))
+
+    outcomes = asyncio.run(runner.recover_in_flight_trades())
+
+    assert outcomes == [(contract, "applied_confirmed")]
+    assert positions[contract]["in_flight_trade"] is None
+    assert positions[contract]["closed"] is True, \
+        "a confirmed-after-restart terminal sell must actually close the position"
+
+
+def test_recovery_confirmed_partial_sell_leaves_position_open(isolated_positions, monkeypatch):
+    positions, _ = isolated_positions
+    contract = "TestRecoverConfPartial1" + "9" * 16
+    base = _full_position("Y", contract, initials_taken=False)
+    plan = exit_logic._plan_sell(
+        base, exit_logic.INITIALS_SELL_FRACTION,
+        "initials: test", 40_000, "initials", initials_level=39_000,
+    )
+    positions[contract] = _full_position(
+        "CONFPARTIAL", contract, initials_taken=False,
+        in_flight_trade={"direction": "sell", "plan": plan, "signature": "sig-def"},
+    )
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="confirmed"))
+
+    outcomes = asyncio.run(runner.recover_in_flight_trades())
+
+    assert outcomes == [(contract, "applied_confirmed")]
+    assert positions[contract]["initials_taken"] is True
+    assert positions[contract]["closed"] is False
+    assert positions[contract]["tokens_remaining"] == pytest.approx(0.67, abs=1e-9)
+
+
+def test_recovery_confirmed_buy_applies_missed_update(isolated_positions, monkeypatch):
+    positions, _ = isolated_positions
+    contract = "TestRecoverConfBuy1" + "9" * 20
+    tranche = {"stage": 2, "sol": 0.1, "drop_pct_from_previous_fill": 10}
+    position = _full_position("CONFBUY", contract, pending_tranches=[tranche])
+    plan = runner._plan_dca_fill(position, position["last_fill_mc"] * 0.85)
+    position["in_flight_trade"] = {"direction": "buy", "plan": plan, "signature": "sig-ghi"}
+    positions[contract] = position
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="confirmed"))
+
+    before_invested = position["sol_invested"]
+    outcomes = asyncio.run(runner.recover_in_flight_trades())
+
+    assert outcomes == [(contract, "applied_confirmed")]
+    assert positions[contract]["in_flight_trade"] is None
+    assert positions[contract]["pending_tranches"] == []
+    assert positions[contract]["sol_invested"] == pytest.approx(before_invested + 0.1)
+
+
+def test_recovery_reverted_clears_without_applying(isolated_positions, monkeypatch):
+    positions, _ = isolated_positions
+    contract = "TestRecoverReverted1" + "9" * 19
+    plan = exit_logic._plan_sell(
+        _full_position("Z", contract, initials_taken=True), 1.0,
+        "trailing stop: test", 10_000, "trailing_stop",
+    )
+    positions[contract] = _full_position(
+        "REVERTED", contract, initials_taken=True,
+        in_flight_trade={"direction": "sell", "plan": plan, "signature": "sig-jkl"},
+    )
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="failed"))
+
+    outcomes = asyncio.run(runner.recover_in_flight_trades())
+
+    assert outcomes == [(contract, "cleared_reverted")]
+    assert positions[contract]["in_flight_trade"] is None
+    assert positions[contract]["closed"] is False, "a reverted sell must not close the position"
+    assert positions[contract]["tokens_remaining"] == 1.0
+
+
+def test_recovery_timeout_leaves_flag_and_alerts(isolated_positions, monkeypatch, caplog):
+    positions, _ = isolated_positions
+    contract = "TestRecoverTimeout1" + "9" * 20
+    in_flight = {"direction": "sell", "plan": {"tokens": 1.0}, "signature": "sig-mno"}
+    positions[contract] = _full_position(
+        "TIMEOUT", contract, initials_taken=True, in_flight_trade=in_flight,
+    )
+    monkeypatch.setattr(trade_execution, "confirm_transaction",
+                        AsyncMock(return_value="timeout"))
+
+    with caplog.at_level("ERROR", logger="alerting"):
+        outcomes = asyncio.run(runner.recover_in_flight_trades())
+
+    assert outcomes == [(contract, "needs_human_review")]
+    assert positions[contract]["in_flight_trade"] == in_flight, \
+        "an unresolved timeout must leave in_flight_trade in place, never guess"
+    assert any(
+        "[ALERT]" in r.message and "fill_uncertain" in r.message and "sig-mno" in r.message
+        for r in caplog.records
+    )
+
+
+def test_recovery_no_in_flight_trades_is_a_no_op(isolated_positions):
+    positions, _ = isolated_positions
+    contract = "TestRecoverNoop1" + "9" * 22
+    positions[contract] = _full_position("NOOP", contract, in_flight_trade=None)
+
+    outcomes = asyncio.run(runner.recover_in_flight_trades())
+
+    assert outcomes == []
