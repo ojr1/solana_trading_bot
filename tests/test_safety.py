@@ -1210,3 +1210,71 @@ def test_recovery_no_in_flight_trades_is_a_no_op(isolated_positions):
     outcomes = asyncio.run(runner.recover_in_flight_trades())
 
     assert outcomes == []
+
+
+# ---------------------------------------------------------------------------
+# STAGE 10 PART 3 - reserve-check race fix, brief_stage10_autonomous.md
+# ---------------------------------------------------------------------------
+
+
+def test_reserved_sol_sums_only_in_flight_buys(isolated_positions):
+    positions, _ = isolated_positions
+    positions["TestResA" + "9" * 33] = _full_position(
+        "A", "TestResA" + "9" * 33,
+        in_flight_trade={"direction": "buy", "plan": {"sol": 0.10}, "signature": "s1"},
+    )
+    positions["TestResB" + "9" * 33] = _full_position(
+        "B", "TestResB" + "9" * 33,
+        in_flight_trade={"direction": "buy", "plan": {"sol": 0.05}, "signature": "s2"},
+    )
+    # An in-flight SELL must not count - it returns SOL, it doesn't spend it.
+    positions["TestResC" + "9" * 33] = _full_position(
+        "C", "TestResC" + "9" * 33, initials_taken=True,
+        in_flight_trade={"direction": "sell", "plan": {"tokens": 1.0}, "signature": "s3"},
+    )
+    # No in-flight trade at all - must not contribute.
+    positions["TestResD" + "9" * 33] = _full_position("D", "TestResD" + "9" * 33)
+
+    assert runner.reserved_sol(positions) == pytest.approx(0.15)
+
+
+def test_reserve_check_blocks_when_in_flight_buys_would_breach_reserve(
+    isolated_positions, monkeypatch,
+):
+    """Two near-simultaneous entries: the first is in-flight (not yet
+    reflected in the real balance), the second's reserve check must still
+    account for it and block rather than double-spend against the same
+    balance."""
+    positions, _ = isolated_positions
+    monkeypatch.setattr(runner.wallet, "get_balance", AsyncMock(return_value=0.20))
+    monkeypatch.setattr(config, "MIN_SOL_RESERVE", 0.05)
+
+    # 0.10 SOL already committed to an unresolved in-flight buy.
+    positions["TestResE" + "9" * 33] = _full_position(
+        "E", "TestResE" + "9" * 33,
+        in_flight_trade={"direction": "buy", "plan": {"sol": 0.10}, "signature": "s4"},
+    )
+
+    # Without the reservation: 0.20 - 0.08 = 0.12 >= 0.05 -> would pass.
+    # With it: 0.20 - 0.08 - 0.10 = 0.02 < 0.05 -> must block.
+    result = asyncio.run(runner.check_reserve_ok(0.08))
+
+    assert result is False
+
+
+def test_reserve_check_allows_when_in_flight_buys_still_leave_room(
+    isolated_positions, monkeypatch,
+):
+    positions, _ = isolated_positions
+    monkeypatch.setattr(runner.wallet, "get_balance", AsyncMock(return_value=1.0))
+    monkeypatch.setattr(config, "MIN_SOL_RESERVE", 0.05)
+
+    positions["TestResF" + "9" * 33] = _full_position(
+        "F", "TestResF" + "9" * 33,
+        in_flight_trade={"direction": "buy", "plan": {"sol": 0.10}, "signature": "s5"},
+    )
+
+    # 1.0 - 0.08 - 0.10 = 0.82 >= 0.05 -> allowed.
+    result = asyncio.run(runner.check_reserve_ok(0.08))
+
+    assert result is True

@@ -355,6 +355,32 @@ def is_call_stale(message_date, now=None):
 # ==========================================================================
 
 
+def reserved_sol(positions):
+    """
+    SOL already spoken for by buy-direction in-flight trades that have not
+    resolved yet - Stage 10 Part 3, LIVE_EXECUTION_PLAN.md question 3.
+
+    Derived fresh from the same in_flight_trade registry Part 2 built,
+    rather than a second, independent counter: a free-floating counter is a
+    second source of truth that can desync from reality after a crash
+    (was the reservation released on restart? by what code path?). This
+    can't desync the same way - it is read straight from the state
+    recover_in_flight_trades() already keeps correct, so the moment an
+    in-flight record is resolved (applied, cleared, or reverted) or
+    recovered after a restart, this figure reflects that automatically.
+
+    Only "buy" direction counts - an in-flight SELL returns SOL, it does
+    not spend it, so it needs nothing reserved against it.
+    """
+    total = 0.0
+    for position in positions.values():
+        in_flight = position.get("in_flight_trade")
+        if in_flight and in_flight.get("direction") == "buy":
+            plan = in_flight.get("plan") or {}
+            total += plan.get("sol", 0.0)
+    return total
+
+
 async def check_reserve_ok(trade_size_sol):
     """
     True if the wallet can afford trade_size_sol AND keep the safety reserve.
@@ -398,12 +424,14 @@ async def check_reserve_ok(trade_size_sol):
         return False
 
     open_count = sum(1 for p in POSITIONS.values() if not p["closed"])
+    reserved = reserved_sol(POSITIONS)
 
-    if balance - trade_size_sol < config.MIN_SOL_RESERVE:
+    if balance - trade_size_sol - reserved < config.MIN_SOL_RESERVE:
         log.warning(
             "RESERVE BLOCK balance=%.4f SOL  trade_size=%.4f SOL  "
-            "reserve_floor=%.4f SOL  open_positions=%d",
-            balance, trade_size_sol, config.MIN_SOL_RESERVE, open_count,
+            "reserved(in-flight buys)=%.4f SOL  reserve_floor=%.4f SOL  "
+            "open_positions=%d",
+            balance, trade_size_sol, reserved, config.MIN_SOL_RESERVE, open_count,
         )
         return False
     return True
